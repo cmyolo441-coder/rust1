@@ -1,0 +1,2591 @@
+# plan.md — Enterprise Terminal AI Agent in Rust
+## Implementation Plan · File-by-File Spec · Parallel Subagent System
+
+| Field | Value |
+|---|---|
+| **Status** | Planning complete — ready for kickoff (no code written yet) |
+| **Product** | `agent` — terminal-native AI coding agent (Claude Code / Codex / Auggie-class) |
+| **Language** | 100% Rust, edition 2024, MSRV pinned per release |
+| **Scope** | Enterprise v1 (P0–P2) + parallel subagents (P1–P3) |
+| **Size** | **308 hand-written source files · ~76,560 LOC** across **19 crates** |
+| **Timeline** | 6 engineers × ~14.5 months (P0 skeleton in 15 weeks) |
+| **This document** | **Sab kuch ek hi file me** — research + architecture + subagents + delivery + 308-file spec + contracts + quality + enterprise + sources |
+| **Date** | 30 October 2026 |
+
+---
+
+## Document map (ek hi file, 9 parts)
+
+| Part | § | Section | Kya milega |
+|---|---|---|---|
+| **I** | 0–1 | Research | TL;DR + file-count answer, method & measured data, product landscape, 12 enterprise pillars, harness evidence |
+| **II** | 2–3 | Product | Mission, personas, scope/non-goals, 12 golden rules, success metrics, commands, modes, config, exit codes, UX flows |
+| **III** | 4–5 | Architecture | 7 planes, event-sourced core, turn state machine, concurrency, latency budget, Rust trade-offs, 19-crate map, dependency rules, failure semantics |
+| **IV** | 6 | Subsystems | Context economy, tool/patch plane, model gateway, sandbox & permissions, state/resume, TUI, MCP/ACP/hooks/skills, governance, threat model |
+| **V** | 7 | **Parallel subagents** | DAG planner, deterministic scheduler, file leases, isolation levels, merge queue + verify gates, safety, metrics |
+| **VI** | 8 | Delivery | P0–P3 phases, 15 sprints, gates, ownership, effort math, 15 ADRs, dependency list, Go→Rust migration |
+| **VII** | 9 | **File-by-file spec** | **308 files**: exact code + features/acceptance + LOC + phase, crate by crate |
+| **VIII** | 10–13 | Contracts → Execution | Event/op/tool catalogues, policy grammar, DB schema, error codes · test matrix, evals, perf budgets, CI · enterprise readiness · DoD, risks, backlog, traceability |
+| **IX** | 14 | Appendix | Sources |
+
+## Teen non-negotiables (poore plan ka summary)
+
+1. **Event-sourced core** — UI, server, replay, audit sab ek hi event stream ke projections hain. Isse resume, testing aur multi-surface free me milte hain.
+2. **Context economy first-class** — token ledger + cache-aware ordering + 5-stage compaction. Yahi 3–10× cost delta aur "agent got dumb" complaints ka fix hai.
+3. **Deny-first safety** — policy → approval → OS sandbox → resource limits → audit, paanch independent layers. Sandbox P0 me hai, retrofit me nahi.
+
+---
+
+# PART I — Research: market, evidence, lessons
+
+## 0. Sawaal ka seedha jawab (TL;DR)
+
+Aapne poocha: *"200–300 files ka code to zarur hoga?"*
+
+**Haan — exactly sahi andaaza hai.** Lekin sirf tab, jab aap "enterprise-level v1" bana rahe ho, "Codex ke barabar" nahi.
+
+| Level | Hand-written source files | Est. LOC | Kya milta hai | Real-world anchor |
+|---|---:|---:|---|---|
+| **Tier A — Demo / prototype** | 45–65 | 9k–14k | Read/edit/shell + single-provider loop + plain REPL | Weekend-to-4-week projects |
+| **Tier B — Serious OSS tool** | 140–170 | 32k–40k | Multi-provider, approvals, sessions/resume, decent TUI, tests | Chhote OSS agents |
+| **Tier C — Enterprise v1 (Aapka target)** | **308** | **~76,500** | 19 crates, 3-OS sandbox, MCP+ACP, hooks/skills, audit, SSO, parallel subagents, evals, signed releases | Goose ka ~52% Rust surface, Crush ke barabar se thoda bada |
+| **Tier D — Frontier parity** | 1,200–2,500 | 250k–450k | Multi-surface (TUI+IDE+desktop+cloud), multi-agent orchestration, telemetry mesh | Codex (5,706 `.rs` files, ~549k LOC) |
+
+**Is document ka concrete deliverable:** ek 308-file / 76,560-LOC blueprint — har file ka naam, role, estimated LOC aur delivery phase ke saath (Part VII), plus effort math, team plan, risk register, ADRs aur dependency list (Part VI).
+
+### Ek line me core thesis
+
+> Terminal agent ka **model-facing logic 1–2% hota hai**. Baaki 98% "harness" hai — context economy, permission plane, state machine, sandbox, renderer, replay, audit. Isi liye 300+ files lagti hain: model ek API call hai, product uske *aas-paas ka operating system* hai.
+
+Is thesis ka evidence section 1.3 me hai (Claude Code ke reverse-engineering se 1.6% figure, aur Terminal-Bench ka "scaffold effect" — same model, different harness = same task pe **40× token difference**, accuracy sirf 0–8 pp badalti hai [12][13]).
+
+### Numbers jo yaad rakhne hain
+
+| Metric | Value | Note |
+|---|---:|---|
+| Source files (hand-written) | **308** | 19 crates, avg 249 LOC/file |
+| Test + snapshot files | ~179 + ~250 | insta snapshots Rust me default practice hai |
+| Total tracked files | **~750** | Codex me 1,671 `.snap` files hain — snapshots normal hain |
+| P0 (walking skeleton) | 129 files / 33,040 LOC | Pehle 3–4 mahine |
+| P1 (beta) | +90 files / 22,210 LOC | Agle 3 mahine |
+| P2 (GA) | +67 files / 15,630 LOC | Agle 4–5 mahine |
+| P3 (differentiation) | +14 files / 3,290 LOC | Post-GA |
+| Effort (6 seniors + AI assist) | ~10–12 mahine | 5.5–6.5 person-year |
+| Effort (3 engineers) | ~20–26 mahine | Scope cut karna padega |
+| Binary size target | 28–38 MB stripped | Codex single binary isi range me |
+| Cold start target | < 60 ms | Rust ka pura fayda yahan hai |
+
+### Kya aapko *nahi* karna chahiye
+
+1. **300 files ko ek hi crate me mat dalo.** 300 files / 1 crate = 40+ minute incremental builds, merge conflicts, aur test suite jo har PR pe 6 minute leta hai. 19 crates ka split compile time ka *feature* hai.
+2. **Model se free-form "poora file rewrite" karwana band karo.** Patch-based editing (diff + strict validation + rollback) hi token-efficient aur safe hai.
+3. **Sandbox ko baad me mat jodo.** Ye baad me retrofit karne pe har tool signature badalta hai.
+4. **Embeddings/RAG ko default mat banao.** tree-sitter repo-map + grep 90% kaam karta hai, zero infra me. (Aider ka repo-map ka data point section 3.1.5 me.)
+5. **"Enterprise" ka matlab SSO + audit + air-gap hai — extra features nahi.** Wo 4 crates (policy/auth/telemetry/state) design ke *pehle din* se chahiye, warna audit trail fake ban jaata hai — jaisa aapke current `ENTERPRISE_PLAN.md` me "Phase 2" me retrofit hua.
+
+---
+
+## 1. Research method (isse maine kaise nikala)
+
+Guessing nahi — teen tarah ke evidence use kiye:
+
+**(a) Direct measurement (GitHub API, 30 Oct 2026).** Real agents ke repos ka file tree pull karke count kiya:
+
+| Repo | Language | Source files | Total files | Notes |
+|---|---|---:|---:|---|
+| `openai/codex` | Rust | **5,706 `.rs`** | 9,791 | +1,671 `.snap`, 784 `.ts`, 211 Bazel |
+| `aaif-goose/goose` | Rust | **598 `.rs`** | 2,559 | +340 `.tsx` (Electron UI) |
+| `charmbracelet/crush` | Go | **844 `.go`** | 1,357 | +363 golden files |
+| `sst/opencode` | TS | 4,787 `.ts` + 832 `.tsx` | 9,242 | Rust sirf 34 files (TUI plugin) |
+| `Aider-AI/aider` | Python | — | — | 140 MB repo, ~90 modules |
+
+Isse do cheezein clear hoti hain: (i) **Rust agents 500–5,700 files ke range me hote hain**, (ii) aapka 300-file target *upar* ka realistic v1 hai, neeche ka nahi.
+
+**(b) Architecture teardown.** Codex ka crate split, Goose ka crate layout, Gemini CLI ke 7 packages, Claude Code ka post-hoc analysis (UCL ke reverse-engineering paper [5], community gists [6][7]), Aider ka repo-map internals, Auggie/Devin ki feature surface.
+
+**(c) Standards + ecosystem state.** MCP spec revision `2026-07-28` (stateless core) [9], official Rust SDK `rmcp` [10], ACP (Zed, JSON-RPC over stdio, 37 agents) [11], ratatui/crossterm terminal capability matrix [8], OS sandbox primitives (Landlock/seccomp/Seatbelt/AppContainer) [14].
+
+**Honesty note:** web sources me Codex ke crate count pe disagreement hai (52 vs 70 vs 130 vs "208 crates in binary"). Ye isliye hai ki log *workspace members*, *dependency count*, aur *linked crates* ko mix karte hain. Main is document me "70–160 internal crates" range bolta hoon aur file counts pe bharosa karta hoon, kyunki wo maine khud measure kiye.
+
+### 1.1 Product landscape — jo aapko beat karna hai
+
+| Product | Type | Harness ka differentiator | Rust ke liye lesson |
+|---|---|---|---|
+| **Claude Code** | Closed, TS/Node | 7 permission modes, 5-layer compaction, 27 hook events, subagent sidechains, ML permission classifier | Harness hi product hai; hooks/compaction ko first-class banao |
+| **Codex CLI** | Open, Rust | 5,700 files, event/op protocol, app-server JSON-RPC, 3-OS sandbox, apply-patch crate | Crate split = parallelism; protocol crate alag rakho |
+| **Gemini CLI** | Open, TS | 7 packages, policy TOML engine, checkpointing (shadow git), 5 sandbox variants | Policy engine ko declarative + testable rakho |
+| **Goose** | Open, Rust | MCP-native, 15+ providers, recipes, LLM "adversary inspector" | Extension-first design; built-in tools bhi MCP jaisa shape |
+| **Crush** | Open, Go | Provider-agnostic, polished TUI, LSP awareness | TUI quality hi retention hai |
+| **Aider** | Open, Python | tree-sitter + PageRank repo map, 6 edit formats, auto-commit | Repo map = best context/₹ ratio |
+| **Auggie (Augment)** | Closed | Persistent semantic index, ACP, CI/headless modes | Index ko background service samjho, per-prompt nahi |
+| **Devin** | Closed, cloud | Long-horizon autonomy, browser+shell, PR loop | Autonomy = recovery + verification, intelligence nahi |
+
+### 1.2 "Enterprise-grade" ka matlab (12 pillars)
+
+Enterprise buyers ko model quality se zyada **controls** se matlab hai [15][16]. Ye 12 pillars is plan ke acceptance criteria hain:
+
+1. **Identity** — har session ek named human se bound (OIDC/SAML device flow), CI ke liye service accounts.
+2. **Policy-as-code** — admin-managed, signed, developer-override-proof settings file.
+3. **Permission plane** — deny-first rules + risk classifier + approval modes; session-scoped grants.
+4. **OS-level sandbox** — Linux (bubblewrap/Landlock/seccomp), macOS (Seatbelt), Windows (AppContainer + Job Object).
+5. **Egress control** — default-deny network, allowlist via proxy; SSRF guard on fetch.
+6. **Audit trail** — tamper-evident (hash-chained), SIEM-exportable (syslog/OTLP), per-action attribution.
+7. **Data governance** — local-first by default, redaction before egress, retention policy, zero-retention mode.
+8. **Air-gap mode** — BYO endpoint (vLLM/Ollama/Bedrock/Vertex), no phone-home, offline license check.
+9. **Supply chain** — signed binaries + notarization, SBOM, `cargo-deny`, reproducible builds, updater rollback.
+10. **Observability** — opt-in OTel traces, local ring-buffer logs, one-command redacted support bundle.
+11. **Extensibility without forking** — MCP, ACP, hooks, skills, plugins (signed), custom slash commands.
+12. **Operability** — headless/CI mode with stable exit codes, JSONL streaming, `doctor`, deterministic replay.
+
+Agar inme se 4 bhi missing hain, aap "enterprise" nahi keh sakte — chahe model frontier ho.
+
+### 1.3 Kyun harness par sab kuch depend karta hai (evidence)
+
+- Claude Code ke source analysis me **~1.6% code AI decision logic** hai; baaki permission gates, tool routing, compaction, recovery, persistence [5][6].
+- Terminal-Bench 2.0 pe **same model, do harness** = 52.1% vs 57.8%, par input tokens **256.9M vs 3.9M (65×)** [13].
+- Ek controlled study (3 harnesses × 2 models × 50 tasks) me **tokens per solved task me 40× gap**, pass-rate me sirf 0–8 pp [12].
+- Same model pe custom scaffold 62.3% → 70.3% (SWE-bench Verified) [13].
+
+**Interpretation:** model badalne se zyada farq padta hai ki aap uska *context, tools, retries, verification aur stop-condition* kaise design karte ho. Isi liye 74k LOC ka 90% "boring" infrastructure hai — aur wahi moat hai.
+
+---
+
+# PART II — Product: mission, scope, surface
+
+## 2. Mission, scope aur success criteria
+
+### 2.1 Mission statement
+
+> Ek aisa terminal agent banao jo **engineer ki jagah nahi, engineer ke haath tez** kare — local-first, auditable, sandboxed, aur itna fast ki `git status` se pehle khul jaye. Enterprise team isko rollout kar sake bina security review me atakne ke.
+
+### 2.2 Target users (3 personas, teeno ka same binary)
+
+| Persona | Kya chahiye | Kya todta hai |
+|---|---|---|
+| **Individual dev** (80%) | Fast TUI, acche diffs, model choice, cheap | Slow startup, prompts har 10 second, config hell |
+| **Platform / DevEx team** (15%) | CI mode, policy, hooks, MCP integrations, stable JSON | Non-deterministic output, breaking CLI flags |
+| **Security / compliance** (5%) | Sandbox, audit, SSO, air-gap, no data egress | "We'll add logging later", silent network calls |
+
+### 2.3 Jobs to be done (v1)
+
+1. "Is repo me bug fix karo aur tests chalao" — **long-horizon task**, 20+ turns.
+2. "Ye error kya hai?" — **fast question**, < 5 s first token.
+3. "PR review karo, sirf high-severity batao" — **headless**, CI me.
+4. "Is codebase ka architecture samjhao" — **repo map + grep**, bade repo me bhi.
+5. "Ye 5 independent cheezein parallel karo" — **parallel subagents** (§7).
+6. "Editor se chalao" — **ACP**, Zed/JetBrains/Neovim me.
+
+### 2.4 In scope (v1) / out of scope
+
+| In scope | Out of scope (explicit non-goals) |
+|---|---|
+| Terminal TUI + headless exec + JSONL streaming | GUI/desktop app, Electron wrapper |
+| 8+ model providers + local models | Training/fine-tuning models |
+| 3-OS sandbox (Linux/macOS/Windows) | Cloud-hosted agent runtime (v2) |
+| MCP client + MCP server mode + ACP agent | Editor plugins (ACP se free milta hai) |
+| Skills, hooks, custom commands, plugins (signed) | Marketplace/billing infra |
+| Parallel subagents (DAG + worktrees + merge gates) | Browser automation (v2) |
+| Audit, policy, SSO, air-gap mode | SCIM server (control plane ka kaam) |
+| Session persistence, replay, resume, undo | Cross-device sync service |
+
+**Rule:** agar koi feature in "out of scope" me se aata hai, wo v1 ko *nahi* block karega — backlog §13 me jaayega.
+
+### 2.5 Constraints
+
+- **Rust only** — koi Node/Python runtime dependency nahi (npm sirf binary shim).
+- **Terminal-first** — TUI 80×24 pe bhi usable; mouse optional.
+- **Local-first** — bina internet ke start ho, config error pe bhi sane defaults (except provider calls).
+- **Single static binary** — < 38 MB stripped; `scp` karke chale.
+- **No `unsafe`** outside `sandbox` + `exec` (aur wahan documented invariant).
+- **Backward compatibility** — CLI flags, config keys, protocol events: semver + deprecation cycle (2 minor releases).
+
+### 2.6 12 golden rules (architectural invariants — CI-enforced jahan possible)
+
+| # | Rule | Kyun | Kaise enforce |
+|---|---|---|---|
+| 1 | **Ek writer per thread** (actor model) | data races, torn state impossible | `Session` non-`Sync` handle; clippy lint + review |
+| 2 | **Op in, Event out** — UI me business logic nahi | replay, testability, multi-surface | `tui` ka dependency sirf `protocol`+`core` handle |
+| 3 | **Har mutation ek event** | crash consistency, audit | state changes only inside `core/agent/*` |
+| 4 | **Path confinement ek hi function** | escape bugs ek jagah | `core/util/paths.rs` + `tools/path_guard.rs`, code review ban on other path joins |
+| 5 | **Deny-first policy** | allow-all config bhi safe | `policy/engine.rs` order (deny → allow → ask) |
+| 6 | **Sandbox fail-closed** | silent unsandboxed = breach | `sandbox/probe.rs` + explicit `--no-sandbox` + audit |
+| 7 | **Truncation informative** | model ko agla step pata chale | `tools/result_policy.rs` test: har truncation me hint |
+| 8 | **Cache-stable prefix** | 3–10× cost | snapshot test on assembler order |
+| 9 | **Tool schema budget** | 40 tools = 6k tokens before prompt | `context/tool_budget.rs` + metric |
+| 10 | **Every file has one owner** | review quality | `CODEOWNERS` per crate |
+| 11 | **No silent fallback** | enterprise trust | every degrade = warning + audit entry |
+| 12 | **Prompt files are code** | behavior regressions | snapshots + evals gate prompt changes |
+
+### 2.7 Success metrics (v1 GA)
+
+| Metric | Target | Kaise measure |
+|---|---:|---|
+| Cold start | < 60 ms (p95) | hyperfine CI |
+| First visible token after Enter (network excl.) | < 120 ms | instrumented |
+| Idle RSS | < 120 MB | CI memory test |
+| Task success (internal 40-task suite) | > 70% pass@1 | eval harness §11.3 |
+| Tokens per solved task | < 120k median | eval harness (harness quality metric) |
+| Tool call error rate | < 4% | telemetry (opt-in) |
+| Context compactions per 100 turns | < 15 | ledger metrics |
+| Prompt cache hit rate (Anthropic/OpenAI) | > 60% | provider usage |
+| Merge conflict rate (parallel mode) | < 10% of merges | orchestrator metrics |
+| Parallel speedup (5 independent tasks) | > 1.8× serial time | benchmark job |
+| Crash-free sessions | > 99.5% | telemetry |
+| Sandbox escape findings (external audit) | 0 critical | pentest |
+
+**Anti-metrics (jo hum *nahi* optimize karte):** lines of code, number of tools, number of providers, benchmark score without token cost. In sab ne agents ko kharab banaya hai.
+
+---
+
+## 3. Product surface — user ko kya dikhta hai
+
+### 3.1 Commands (top-level)
+
+| Command | Purpose | Mode |
+|---|---|---|
+| `agent` | interactive TUI (default) | TTY |
+| `agent "prompt"` | one-shot with TUI streaming, phir exit | TTY |
+| `agent exec -f task.md --json` | headless, CI-friendly, JSON/JSONL out | non-TTY |
+| `agent exec --resume <id>` | session continue | non-TTY |
+| `agent review --base main --fail-on high` | diff review + exit code | CI |
+| `agent mcp serve` | agent ko MCP server banao (doosre agents ke liye) | stdio |
+| `agent acp` | ACP agent mode (editors spawn karte hain) | stdio |
+| `agent auth login\|logout\|status` | credentials | — |
+| `agent config get\|set\|list\|edit\|explain` | config | — |
+| `agent session list\|show\|export\|rm` | sessions | — |
+| `agent doctor [--json]` | environment diagnostics | — |
+| `agent audit verify\|export` | tamper check + SIEM export | — |
+| `agent update [--check]` | signed self-update | — |
+| `agent completions <shell>` | shell completions | — |
+
+### 3.2 Interaction modes (permission modes)
+
+`--mode` (ya `/mode` se live switch):
+
+| Mode | Reads | Edits | Shell | Network | Kiske liye |
+|---|---|---|---|---|---|
+| `plan` | ✅ | ❌ | ❌ (ro commands) | ❌ | design/analysis, untrusted repos |
+| `read-only` | ✅ | ❌ | ❌ | ❌ | review, audit |
+| `ask` *(default)* | ✅ | ✅ prompt | ✅ prompt | prompt | daily dev |
+| `auto-edit` | ✅ | ✅ auto | ✅ prompt | prompt | power users |
+| `bypass` | ✅ | ✅ | ✅ | ✅ | containers/CI (banner + audit) |
+
+**UX detail:** approval prompt me hamesha — exact command/argv, cwd, risk badge (read/mutate/destructive/network), sandbox status, aur "always allow this pattern" ka expanded preview. `Esc` = deny. Default focus = **Deny** (Enter pe deny, `y` pe allow) — safe default.
+
+### 3.3 Slash commands (TUI)
+
+| Command | Kya karta hai |
+|---|---|
+| `/model [name]` | model picker (cost + context ke saath) |
+| `/mode [name]` | permission mode switch (audit) |
+| `/context` | token ledger breakdown (system/tools/memory/history) |
+| `/compact [focus]` | manual compaction with focus hint |
+| `/cost` | session spend, per-turn, cache hit rate |
+| `/permissions` | rules list, add/remove, scope preview |
+| `/undo` | last turn ke file changes revert |
+| `/resume [id]` | session list + resume |
+| `/board` | parallel workers board (§7) |
+| `/workers [kill <id>]` | worker management |
+| `/diff` | pending diff review (accept/reject hunks) |
+| `/help [topic]` | help + keybindings + concepts |
+| `/quit` | graceful exit (children cleanup) |
+
+### 3.4 Keybindings (defaults)
+
+| Key | Action |
+|---|---|
+| `Enter` | submit (in composer) |
+| `Alt+Enter` / `Ctrl+J` | newline |
+| `Ctrl+C` | interrupt turn (twice = quit) |
+| `Esc` | deny/cancel modal, clear input |
+| `Ctrl+R` | history search |
+| `Ctrl+O` | expand/collapse tool card |
+| `Ctrl+B` | board toggle |
+| `Ctrl+D` | debug overlay (last request, ledger, timings) |
+| `Tab` | completion (`@file`, `/cmd`) |
+| `PgUp/PgDn`, `Ctrl+U/D` | transcript scroll |
+| `?` | help overlay |
+
+Vim mode optional (`keymap/vim.rs`), off by default.
+
+### 3.5 On-disk layout
+
+```
+~/.config/agent/        config.toml · AGENTS.md · mcp.toml · hooks/ · skills/ · commands/
+~/.local/share/agent/   sessions/*.jsonl · index.sqlite · blobs/ · logs/ · worktrees/
+~/.cache/agent/         repo-map tags · schema cache · completions
+<repo>/.agent/          config.toml · rules/*.md · commands/*.md · agents/*.md
+<repo>/AGENTS.md        project memory (git-tracked)
+```
+
+### 3.6 Config surface (v1 keys)
+
+| Section | Keys | Notes |
+|---|---|---|
+| `model` | provider, name, max_tokens, temperature, reasoning_effort, fallback[] | `provider/model` shortcut |
+| `permissions` | mode, allow[], deny[], ask[], remember_ttl | pattern grammar §10.4 |
+| `sandbox` | enabled, writable[], network, allowlist[], resource{cpu,mem,pids} | fail-closed |
+| `context` | compact_at, repo_map_tokens, keep_recent_files, memory_cap | fractions 0–1 |
+| `tools` | enabled[], disabled[], shell_session, lsp{servers[]} | per-tool toggles |
+| `agents` | max_workers, task_budget, worker_model, merge_policy, isolation | §7.13 |
+| `hooks` | pre_tool_use[], post_tool_use[], ... | paths to executables |
+| `telemetry` | enabled, otlp_endpoint, sample_rate | default **false** |
+| `ui` | theme, keymap, a11y, mouse, images | per-terminal |
+| `enterprise` | managed_policy_path, audit_sink, identity_mode | admin-locked |
+
+`agent config explain <key>` batata hai kaunsi file se value aayi (6-layer precedence).
+
+### 3.7 Exit codes (stable contract for CI)
+
+| Code | Meaning |
+|---:|---|
+| 0 | success |
+| 1 | task/agent error |
+| 2 | CLI usage error |
+| 3 | policy denied (nothing executed) |
+| 4 | sandbox unavailable (fail-closed) |
+| 5 | provider/auth error |
+| 42 | invalid input (bad prompt file, empty stdin) |
+| 53 | turn/budget limit exceeded |
+| 130 | interrupted (SIGINT) |
+
+### 3.8 Core user flows
+
+**Flow A — normal fix (ask mode):** prompt → plan card → tool calls with inline diffs → approval per mutating call → verification (tests) → summary with file list + cost. Esc at any point cancels safely.
+
+**Flow B — headless CI:** `agent exec -f task.md --json` → JSON stream (`turn.delta`, `tool.call`, `result`) → exit code → SARIF/JUnit conversion via `--output-format`. No prompts; policy deny = exit 3.
+
+**Flow C — parallel:** `/board` ya `agent exec --parallel` → planner proposes DAG → user sees task cards → workers run in worktrees → merge queue → verification gate → single consolidated diff for review.
+
+**Flow D — editor (ACP):** editor spawns `agent acp` → prompt → streaming updates → permission request editor UI me → diff editor me render → session resume on reopen.
+
+---
+
+# PART III — Architecture
+
+## 4. Architecture principles — 7 planes, event-sourced core
+
+### 4.1 Planes (logical), crates (physical)
+
+Har serious agent ka same logical shape hota hai. Difference sirf isme hai ki boundaries kitni saaf hain.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ P1  INTERFACE PLANE                                                          │
+│   crates/tui (ratatui)   crates/cli (clap)   crates/server (JSON-RPC + ACP)  │
+│   → teeno sirf Op bhejte hain aur Event padhte hain. Koi business logic nahi. │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ P2  ORCHESTRATION PLANE                        crates/core                  │
+│   ThreadManager → Session → Turn loop → tool router → subagents → budgets    │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ P3  COGNITION PLANE            crates/context   crates/index   crates/model  │
+│   prompt assembly · compaction ladder · repo map · token ledger · providers  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ P4  CAPABILITY PLANE           crates/tools   crates/ext   crates/mcp        │
+│   read/write/patch/grep/glob/shell/lsp/web/plan/task · skills · hooks · MCP  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ P5  EXECUTION PLANE            crates/exec    crates/sandbox                 │
+│   spawn · PTY · process groups · Seatbelt/Landlock/bwrap/AppContainer        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ P6  MEMORY PLANE               crates/state   crates/git                     │
+│   JSONL rollout (truth) · SQLite (query) · snapshots · worktrees             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ P7  CONTROL PLANE              crates/policy  crates/auth  crates/telemetry  │
+│   deny-first rules · approvals · redaction · audit chain · OIDC · OTel       │
+└──────────────────────────────────────────────────────────────────────────────┘
+        cross-cutting: crates/protocol (types) · crates/testkit (tests)
+```
+
+**Dependency rule (CI-enforced, `cargo-deny` + custom lint):**
+
+```
+protocol  ← (sab)
+core      ← tui, cli, server
+core      → model, context, tools, state, policy, exec
+tools     → exec, sandbox, policy, index, git, mcp
+tui       → protocol, core (read-only handle)      ❌ tui ko tools ka pata nahi
+server    → protocol, core                          ❌ server ko tui ka pata nahi
+```
+
+Agar `tui` ko `tools` ka type chahiye, matlab aapne UI ko domain logic de diya hai — wo render *hints* ke through aana chahiye (`tools/src/render.rs`), type ke through nahi.
+
+### 4.2 Kyun 19 crates, ek nahi
+
+| Reason | Concrete effect |
+|---|---|
+| **Incremental compile** | `tui` change karne pe `model` compile nahi hota. 76k LOC monolith = 90–150s incremental; split = 8–20s. |
+| **Testability** | `context` ke unit tests ko HTTP, TUI, ya SQLite nahi chahiye. |
+| **Embedding** | `core` ek library hai — koi SDK/CI tool usse embed kar sakta hai (Codex ne `codex-core` exactly isliye publish kiya). |
+| **Feature gating** | `server` aur `git` optional features ho sakte hain → minimal build 18 MB. |
+| **Blast radius** | Sandbox bug sandbox crate me fail hota hai, poore binary me nahi. |
+
+Trade-off: 19 crates = 19 `Cargo.toml` + workspace dependency management + version pinning. Ye cost 3–4 din ka hai, one-time.
+
+### 4.3 Event-sourced turn (sabse important architectural decision)
+
+Purane agents (aur aapka Go version bhi) mutable state rakhte hain: `session.messages.push(...)`, phir UI ko callback. Iska matlab: resume brittle, tests flaky, replay impossible, aur multi-surface (TUI + IDE ek saath) me state divergence.
+
+**Yahan design ye hai:** *op in, event out, state = fold(events)*.
+
+```
+       ┌──────────┐   Op::Submit{prompt}      ┌────────────────────────┐
+ TUI ──┤          ├──────────────────────────►│  Thread actor          │
+ CLI ──┤ Op queue │                           │  (single writer)       │
+ IDE ──┤ (mpsc)   │◄──────────────────────────┤  state: Session        │
+       └──────────┘   Event::*  (broadcast)   └───────────┬────────────┘
+                                                          │
+                    ┌─────────────────────────────────────┼──────────────────┐
+                    ▼                     ▼               ▼                  ▼
+              TUI projection      JSONL rollout     SQLite index       OTel span
+              (pure render)       (source of truth)  (fast query)      (opt-in)
+```
+
+Rules:
+1. **Sirf ek writer** per thread. Koi `Arc<Mutex<Session>>` nahi.
+2. Har mutation ek `Event` emit karti hai (`TurnStarted`, `TextDelta`, `ToolCallRequested`, `ApprovalDecided`, `TokenUsage`, `CompactBoundary`, `TurnCompleted`, `TurnFailed`).
+3. **UI ek pure function hai** `(AppState, Event) -> AppState` (`tui/src/update.rs`, 420 LOC, 100% unit-testable, no terminal needed).
+4. **Replay** = JSONL padho, events re-emit karo, same UI state milega. Bug reports debuggable ho jaate hain — user `--replay session.jsonl` bhejta hai.
+5. **Resume** = JSONL replay + provider context rebuild. Do alag cheezein, do alag code paths, isliye `state/src/resume.rs` sirf 260 LOC me fit hota hai.
+
+Cost: events ka schema discipline (har event versioned, `#[serde(tag = "type")]`), aur thoda extra allocation. Benefit: crash-consistency, replay, test speed, multi-surface sync.
+
+### 4.4 Turn state machine (explicit, not implied)
+
+```
+        ┌─────────┐  Submit   ┌───────────┐  context ok  ┌──────────┐
+        │  Idle   ├──────────►│ Assembling├─────────────►│Streaming │
+        └────┬────┘           └─────┬─────┘              └────┬─────┘
+             ▲                     │ overflow                  │ tool_use
+             │                     ▼                           ▼
+             │              ┌────────────┐             ┌──────────────┐
+             │              │ Compacting │             │  Approving   │
+             │              └─────┬──────┘             └───┬──────┬───┘
+             │                    │ retry                  │allow │deny
+             │                    └────────────────────────┘      │
+             │                                                    ▼
+        ┌────┴─────┐   done   ┌──────────┐  result   ┌──────────────┐
+        │ Completed│◄─────────┤ Verifying│◄──────────┤  Executing   │
+        └──────────┘          └────┬─────┘           └──────┬───────┘
+                                   │ fail                  │ cancel
+                                   ▼                       ▼
+                            ┌────────────┐          ┌────────────┐
+                            │  Retrying  │          │ Cancelled  │
+                            └────────────┘          └────────────┘
+```
+
+**Loop ka shape (illustrative pseudocode — implementation nahi, design intent):**
+
+```
+async fn run_turn(turn: &mut Turn, ops: &mut OpStream) -> Result<TurnOutcome> {
+    loop {
+        // 1. budget + context: explicit, cancelable, no hidden state
+        if turn.budget.exhausted() { return Ok(TurnOutcome::BudgetStop) }
+        let req = context.assemble(&turn.session)?;          // cache-aware sections
+        turn.set(State::Streaming);
+
+        // 2. model call: streaming, cancellable, retryable
+        let mut stream = gateway.stream(req, &turn.cancel).await?;
+        let mut calls: Vec<ToolCall> = vec![];
+        while let Some(chunk) = stream.next().await? {
+            match chunk {
+                Chunk::Text(t)      => emit(Event::TextDelta(t)),
+                Chunk::ToolDelta(d) => calls.assemble(d)?,       // partial JSON buffer
+                Chunk::Usage(u)     => turn.ledger.reconcile(u),
+                Chunk::Done(r)      => { turn.note_finish(r); break }
+            }
+        }
+
+        // 3. no tools -> the turn is over (model decides, not us)
+        if calls.is_empty() { return Ok(TurnOutcome::Completed) }
+
+        // 4. tools: policy -> approval -> execute -> shape
+        turn.set(State::Approving);
+        for call in calls {
+            let decision = policy.evaluate(&call, &turn.approvals).await?;
+            if decision == Deny { emit(Event::ToolDenied(call)); continue }
+            turn.set(State::Executing);
+            let raw = tools.execute(call, &turn.cancel).await?;
+            emit(Event::ToolCompleted(tools.shape(raw)));
+        }
+        // 5. loop again — new evidence enters the window
+    }
+}
+```
+
+Do baatein is shape me intentional hain: **(a)** loop model-driven hai (hardcoded workflow nahi), **(b)** har `await` point cancelable hai — isliye Ctrl-C kabhi bhi safe hai, aur `Drop` guards child processes kill karte hain.
+
+Har state ka ek **owner** aur ek **timeout** hai. `agent/state.rs` (340 LOC) me transitions table-tested hain: illegal transition = compile-time error (enum + exhaustive match), runtime assertion nahi.
+
+### 4.5 Concurrency model (Rust-specific)
+
+| Concern | Mechanism | Kahan |
+|---|---|---|
+| Op queue | bounded `tokio::mpsc` (backpressure = UI freeze nahi, drop nahi) | `core/agent/mod.rs` |
+| Event fanout | `tokio::sync::broadcast` + per-subscriber lag handling | `core/events.rs` |
+| Cancellation | `CancellationToken` tree: turn → tool → subagent → child process | `core/agent/cancel.rs` |
+| Parallel tools | `JoinSet` with per-call timeout + ordered result merge | `core/tools/executor.rs` |
+| Blocking FS | `spawn_blocking` pool; kabhi async runtime pe `std::fs` nahi | `tools/fs/*` |
+| Subagents | alag actor + alag thread id + summary-only return | `core/subagent/mod.rs` |
+| TUI | apna OS thread (crossterm event reader) → channel → tokio | `tui/src/event.rs` |
+| DB | `sqlx` pool, WAL, single-writer transaction | `state/db.rs` |
+
+**Anti-patterns jo maine real agents me dekhe:** `Arc<RwLock<Conversation>>` (deadlock + torn reads), `tokio::spawn` bina handle (cancel impossible, orphan processes), `select!` me biased branches (starvation), aur process kill ke bina `Child::wait` drop (zombies — isliye `exec/src/reaper.rs`).
+
+### 4.6 Ek prompt ka end-to-end journey (latency budget ke saath)
+
+User: *"login bug fix karo"*
+
+| # | Step | Component | Budget |
+|---|---|---|---|
+| 1 | Keystroke → editor buffer → submit | `tui/input/editor.rs` | < 1 ms |
+| 2 | `Op::Submit` → thread actor | `core/agent/mod.rs` | < 1 ms |
+| 3 | Env context refresh (git branch, cwd tree) | `context/sections.rs` | 5–20 ms |
+| 4 | Memory load (AGENTS.md hierarchy, cached) | `context/memory/hierarchy.rs` | 0–10 ms |
+| 5 | Repo map slice (cached tags, PageRank) | `index/repo_map/*` | 10–40 ms (cold 0.5–3 s) |
+| 6 | Token ledger + pressure check | `context/ledger.rs` | < 2 ms |
+| 7 | Prompt assembly with cache boundaries | `context/assembler.rs` | < 5 ms |
+| 8 | Provider request (first byte) | `model/providers/*` | 300–1200 ms (network) |
+| 9 | SSE decode → events → UI render | `model/stream.rs` → `tui/render` | < 1 ms/event |
+| 10 | Tool call complete → policy → approval | `policy/engine.rs` | 1–5 ms (+ human time) |
+| 11 | Sandboxed exec | `sandbox/*` + `exec/*` | command-dependent |
+| 12 | Result shaping → next turn | `core/tools/result_policy.rs` | < 5 ms |
+
+**Local overhead target: 60–80 ms** (steps 1–7 + 9 + 12). Baaki network aur tool time hai. Isi liye "Rust kyun" ka jawab "speed" nahi, "**predictable local latency + memory ceiling**" hai.
+
+### 4.7 Rust: kahan jeetta hai, kahan maarta hai
+
+**Jeetta hai:**
+- Cold start 30–60 ms (Node agents 300–900 ms, warm cache ke baad bhi).
+- Idle RSS 40–120 MB (Electron/Node 200–400 MB).
+- Single static binary — `scp` karke chalao, npm postinstall drama nahi.
+- Process/PTY/signal control first-class (`nix`, `windows-sys`, `portable-pty`).
+- Fearless concurrency: actor model bina data-race anxiety ke.
+- Type-safe protocol: `Event` enum me naya variant add karo → TUI, server, replay, tests sab compile-error se batate hain kahan handle karna hai. **Ye 300+ file codebase ko maintainable rakhta hai.**
+
+**Maarta hai (aur iska mitigation §4.7 me hai):**
+| Problem | Mitigation |
+|---|---|
+| Compile times | 19 crates + `sccache` + `lld`/`mold`; CI me `cargo-nextest`; dev profile `opt-level=1` |
+| Async cancellation bugs | CancellationToken discipline + `Drop` guards + `loom` tests for critical paths |
+| Trait-object bloat / binary size | Generics at boundaries only; `strip`, LTO, `panic=abort` for release |
+| Verbose error plumbing | `thiserror` in libs, `anyhow` only at bin edges; error taxonomy crate |
+| TUI panic → broken terminal | Panic hook + RAII `TerminalGuard` + signal handlers (must-have, day 1) |
+| Cross-platform PTY | `portable-pty` + ConPTY tests on Windows CI (real VM, not cross-compile) |
+| Ecosystem churn | Pin exact versions, vendor `Cargo.lock`, `cargo-deny` advisories |
+| Team ramp-up | ADRs + "one file = one responsibility" rule + golden transcripts for behavior |
+
+---
+
+### 4.8 Config model aur on-disk layout
+
+Config 6 layers me resolve hoti hai (precedence: neeche wala upar wale ko override karta hai):
+
+```
+defaults (compiled) < global < project < project-local < env vars < CLI flags < managed (admin-locked)
+```
+
+Managed layer **sirf admin** set kar sakta hai aur developer usse override nahi kar sakta — enterprise ka core control yahi hai.
+
+```
+~/.config/<agent>/            config.toml · AGENTS.md · mcp.toml · hooks/ · skills/
+~/.local/share/<agent>/        sessions/*.jsonl · index.sqlite · blobs/ · logs/
+~/.cache/<agent>/              repo-map tags · completion cache · schema cache
+<repo>/.agent/                 config.toml · rules/*.md · commands/*.md · agents/*.md
+<repo>/AGENTS.md               project memory (git-tracked, review-able)
+```
+
+Minimal `config.toml` (jo 90% users chahiye):
+
+```toml
+[model]
+provider   = "anthropic"          # anthropic | openai | gemini | ollama | custom
+name       = "claude-sonnet-latest"
+max_tokens = 16000
+temperature = 0.2
+
+[permissions]
+mode = "ask"                      # read-only | ask | auto-edit | plan | bypass
+allow = ["shell(git status)", "shell(git diff)", "read(**)"]
+deny  = ["shell(rm -rf *)", "read(**/.env*)", "net(*)"]
+
+[sandbox]
+enabled = true
+writable = ["."]
+network  = "deny"                 # deny | localhost | allowlist
+allowlist = ["api.anthropic.com", "github.com"]
+
+[context]
+compact_at = 0.72                 # window ka fraction
+repo_map_tokens = 2048
+keep_recent_files = 5
+
+[telemetry]
+enabled = false                   # default OFF
+```
+
+**Design rule:** har config key ka ek schema entry, ek default, ek doc line aur ek validation error message hona chahiye. `config/validate.rs` isi ko enforce karta hai — "unknown key" silently ignore karna enterprise me unacceptable hai (typo = security hole).
+
+---
+
+## 5. Crate map & runtime model — 19 crates
+
+### 5.1 Crate map
+
+| Crate | Files | LOC | Role | Depends on |
+|---|---:|---:|---|---|
+| `protocol` | 14 | 2,950 | Wire contracts: ops, events, IR messages, tool/permission/usage types | — |
+| `testkit` | 4 | 840 | Fixtures, mock provider, golden helpers | protocol |
+| `model` | 26 | 7,500 | Provider adapters, streaming, token/cost, cache, failover | protocol |
+| `core` | 43 | 10,200 | Turn loop, sessions, approvals, budgets, prompt assembly, subagent (single) | protocol, model, policy, tools(late) |
+| `policy` | 12 | 3,040 | Rules, deny-first engine, redaction, audit chain | protocol |
+| `context` | 22 | 5,450 | Assembly, compaction ladder, memory, ledger, pressure | protocol, model |
+| `index` | 8 | 2,150 | tree-sitter repo map, PageRank, grep, file tree | context |
+| `tools` | 39 | 10,520 | File/patch/shell/LSP/web/plan/task tools | core, exec, policy, index, git, sandbox |
+| `exec` | 10 | 2,420 | Spawn, PTY, env, timeouts, output, reaper | protocol |
+| `sandbox` | 12 | 3,420 | bwrap/Landlock/seccomp, Seatbelt, AppContainer, egress | exec |
+| `state` | 17 | 3,520 | JSONL rollout, SQLite, snapshots, resume, GC | protocol |
+| `tui` | 36 | 10,100 | ratatui renderer, input, approvals, board, a11y | protocol, core (handle only) |
+| `cli` | 14 | 2,230 | Subcommands, headless, doctor, update, completions | core, tui, server |
+| `server` | 14 | 3,400 | JSON-RPC app-server, WebSocket, ACP agent | protocol, core |
+| `orchestrator` | 9 | 2,490 | Parallel DAG, scheduler, leases, merge + verify gates | core, state, git |
+| `ext` | 10 | 2,300 | Skills, hooks, plugins, custom commands, profiles | core, tools |
+| `auth` | 6 | 1,310 | Keyring, OAuth PKCE, device code, CI identity | model |
+| `git` | 6 | 1,400 | Repo discovery, diff, commit, worktrees, checkpoints | protocol |
+| `telemetry` | 6 | 1,320 | Tracing, OTLP, metrics, privacy scrubber, support bundle | core |
+| **Total** | **308** | **76,560** | | |
+
+### 5.2 Dependency rule (forbidden edges)
+
+```
+protocol ──► (everyone)                       [types only, zero logic]
+core     ──► model, policy, context, tools    [one-way]
+tui      ──► protocol + core::handle          ✗ tools/model/state types nahi
+server   ──► protocol + core                  ✗ tui, cli nahi
+orchestrator ─► core, state, git              ✗ tui, server nahi
+tools    ──► exec, sandbox, policy, index     ✗ tui, server nahi
+```
+
+`cargo` workspace me enforce: `tui` ke `Cargo.toml` me `tools` na ho, aur CI me ek custom check (`cargo metadata` graph) forbidden edges pe fail kare.
+
+### 5.3 Op → Event flow (single source of truth)
+
+```
+  user/editor/CI
+        │  Op { Submit, Steer, Interrupt, Approve, Compact, SetMode, SpawnWorkers }
+        ▼
+ ┌─────────────────┐    fold     ┌──────────────┐
+ │  Agent actor    │ ──────────► │ Session state│
+ │  (one per thread)│            └──────┬───────┘
+ └────────┬────────┘                   │
+          │ Event (broadcast + persist)│
+    ┌─────┴──────┬──────────┬──────────┴─────┬──────────────┐
+    ▼            ▼          ▼                ▼              ▼
+  TUI         app-server  JSONL rollout   SQLite        telemetry
+ (projection)  (projection) (truth)      (index)        (opt-in)
+```
+
+**Rule of thumb:** agar aap UI me kuch *calculate* kar rahe ho jo core se aana chahiye, galat ho. UI sirf format karta hai.
+
+### 5.4 Threading / concurrency model
+
+| Component | Thread/runtime | Rule |
+|---|---|---|
+| TUI event reader | dedicated OS thread (crossterm) | sends `UiEvent` via channel; never blocks |
+| Render loop | TUI thread (16 ms tick) | pure draw, no I/O |
+| Agent actor | tokio task per thread | owns `Session`, single writer |
+| Tool executor | `JoinSet` (max 8 parallel) | read-only parallel, mutating serial |
+| Shell/PTY | blocking pool + `spawn_blocking` | no `std::fs` on async runtime |
+| Subagent/worker | separate actor + own task | cancel tree, own budget |
+| SQLite | dedicated writer task | single writer, WAL readers |
+| Telemetry exporter | background task | drop on backpressure |
+
+### 5.5 Failure semantics (kya hota hai jab kuch toote)
+
+| Failure | Behavior | User ko dikhta hai |
+|---|---|---|
+| Model 429/5xx | retry with backoff, then failover | "retrying (2/3)…" |
+| Stream drops mid-tool-call | turn replay once, else error | "stream interrupted, retrying" |
+| Context overflow | compact ladder then retry | "compacted (12k → 4k)" |
+| Tool timeout | kill process group, return partial output | "timed out after 120s; showing output so far" |
+| Sandbox denied | fail-closed, audit | "sandbox unavailable: enable bwrap or pass --no-sandbox" |
+| Approval denied | tool not executed, model told why | "denied by policy: shell(rm -rf)" |
+| Worker crash (parallel) | requeue once, then quarantine | board: red card + reason |
+| Merge conflict | rebase retry once, then escalate | "conflict in src/a.rs; worker retried" |
+| Provider auth expired | refresh, else interactive hint | "session expired — run `agent auth login`" |
+| Disk full | stop writes, keep session in memory | "disk full: session not persisted" |
+
+---
+
+# PART IV — Subsystems
+
+## 6. Subsystems — design se implementation tak
+
+### 6.1 Context economy (sabse zyada ROI wala subsystem)
+
+Context window ek budget hai, memory nahi. Isliye `crates/context` (23 files, 5,630 LOC) ek **ledger + scheduler** hai, string concatenation nahi.
+
+#### 6.1.1 Token ledger
+
+```
+Window: 200,000 tokens (model dependent)
+├── reserve_output        16,000   (model ke liye chhoda)
+├── reserve_safety         4,000   (tokenizer error margin — hamesha underestimate karo)
+├── system_core            2,500   (identity + hard rules)
+├── tools_schema           6,000–18,000  ← sabse zyada ignore ki gayi line item
+├── memory                1,000–6,000
+├── repo_map              1,024–4,096
+├── history            remaining
+└── attachments        history me se
+```
+
+Rules jo code me enforce hote hain (`context/ledger.rs`):
+- **Model-facing tools ka schema budget fixed hai.** 40 tools × 150 tokens = 6,000 tokens *har turn* — chat se pehle hi. Isliye `tool_budget.rs` (P2) me **deferred schema disclosure**: 8 core tools eagerly, baaki `tool_search` se on-demand.
+- Ledger estimate vs provider truth ka **drift tracking**: agar 3 turns tak estimate > 8% off hai, safety reserve auto-badhta hai.
+- Prompt cache ke saath ye critical: stable prefix me sirf wahi cheez daalo jo badalti nahi. **Ek changing byte prefix me = poora cache miss = 3–10× cost.**
+
+#### 6.1.2 Compaction ladder (5 stages, cheap se expensive)
+
+Claude Code ka public analysis 5-stage pipeline batata hai [5][6]; design yahan is principle pe hai — *sasta stage pehle, aur jitna kaafi ho wahi ruk jao*.
+
+| Stage | Kya karta hai | Cost | Reversible? | File |
+|---|---|---|---|---|
+| 0. Budget reduce | tool output caps tighten, images drop | 0 | Nahi (lossy) | `compaction/snip.rs` |
+| 1. Snip | purane bade tool results clip (head+tail) | 0 | Nahi | `compaction/snip.rs` |
+| 2. Dedupe | same file ke repeated reads, duplicate outputs | ~0 | Nahi | `compaction/dedupe.rs` |
+| 3. Collapse | inactive segments fold (summary stub + pointer) | 0 | **Haan** | `compaction/collapse.rs` |
+| 4. Summarize | model se structured summary, pinned facts preserve | 1 call | Nahi | `compaction/summarize.rs` |
+| 5. Subagent isolate | exploration child me, sirf summary parent me | 1 call | Nahi | `core/subagent/` |
+
+Summary prompt ka contract (structured, not prose): *goal, decisions made, files touched + why, failing tests, open questions, next 3 steps*. Isse "amnesia" fix hota hai — Claude Code ke analysis me bhi yahi pattern hai.
+
+**Post-compaction restore:** last 5 edited files ka content + active plan re-inject (`compaction/restore.rs`). Bina iske model bhool jaata hai ki wo kya kar raha tha — empirically sabse common "agent got dumber" complaint.
+
+#### 6.1.3 Cache-aware assembly
+
+Provider prompt caching (Anthropic `cache_control`, OpenAI automatic prefix cache) sirf tab kaam karta hai jab **prefix byte-identical** ho.
+
+Assembly order (fixed):
+```
+[ system: identity + rules ]        ← never changes in a session
+[ system: tool schemas ]            ← stable per toolset
+[ system: memory (AGENTS.md) ]      ← stable per directory set
+[ user: env snapshot ]              ← changes rarely (branch, date)
+────────────── cache boundary ──────────────
+[ history: compacted prefix ]
+[ history: recent turns ]           ← grows
+[ user: current prompt ]            ← changes every turn
+```
+
+`context/assemble.rs` is order ko *enforce* karta hai — koi bhi code jo env ko system se pehle daalna chahe, test fail karega (`cache_aware_order` snapshot test).
+
+#### 6.1.4 Memory hierarchy (file-based, transparent)
+
+| Layer | Path | Loaded | Size cap |
+|---|---|---|---|
+| Managed | `/etc/<agent>/AGENTS.md` | always | 4 KB |
+| User | `~/.config/<agent>/AGENTS.md` | always | 8 KB |
+| Project root | `./AGENTS.md` | always | 16 KB |
+| Nested | `./sub/AGENTS.md` | **lazy**, us dir ko read karne pe | 8 KB |
+| Local | `./AGENTS.local.md` (gitignored) | always | 8 KB |
+| Rules | `./.agent/rules/*.md` (glob-scoped) | lazy | 4 KB each |
+
+Why file-based: audit-able, diff-able, review-able. Why not embeddings-only: opaque, stale, aur "why did the agent do that" ka jawab nahi deta.
+
+#### 6.1.5 Repo map (bade codebase ka jawab)
+
+Aider ka proven design [17]: tree-sitter se definitions/references nikalo → file graph banao → **personalised PageRank** → token budget me top symbols render karo.
+
+Numbers jo design decide karte hain:
+- Cost: 1,024–4,096 tokens for a 500k-LOC repo map — full-file dumping se 100× sasta.
+- Cold build: 0.5–3 s (parallel tree-sitter, rayon), incremental: 10–40 ms (mtime+hash cache in SQLite).
+- Ranking knobs: chat me mentioned symbols ×10, already-open files ×50, long identifiers ×10, edge weight = `sqrt(ref_count)`.
+- Failure mode: low-PageRank peripheral code map me nahi aata → isliye **grep tool mandatory hai** (map = prior, grep = recall).
+
+`index` crate 8 files / 2,150 LOC — yahi 80% "codebase understanding" hai. Embeddings (P3, optional) sirf tab jab map+grep fail karein.
+
+---
+
+### 6.2 Tool plane — kam tools, gehri quality
+
+#### 6.2.1 Tool set (v1: 14 core tools)
+
+| Tool | Risk class | Notes |
+|---|---|---|
+| `read_file` | read | paged (line ranges), binary detect, image passthrough |
+| `write_file` | mutate | atomic write, backup, encoding preserve |
+| `edit_file` | mutate | exact string replace + occurrence disambiguation |
+| `apply_patch` | mutate | unified diff/V4A, validated, transactional |
+| `glob` | read | gitignore-aware, capped |
+| `grep` | read | regex + context lines, type filters |
+| `shell` | **exec** | persistent session, risk-scanned, sandboxed |
+| `list_dir` | read | tree with sizes |
+| `todo_write` | state | plan visibility (bahut under-rated) |
+| `task` | spawn | subagent with budget |
+| `web_fetch` | net | SSRF guard, size cap, HTML→text |
+| `ask_user` | meta | structured elicitation |
+| `git_status/diff` | read | prompt-friendly summaries |
+| `diagnostics` (LSP) | read | post-edit errors |
+
+**Design rule:** naya tool tabhi jab primitive composition se possible na ho. "Jira tool" nahi — `shell` + `web_fetch` + MCP.
+
+#### 6.2.2 Patch strategy (token economics ka core)
+
+Teen options, measured reality:
+
+| Format | Tokens (100-line edit) | Failure mode | Verdict |
+|---|---:|---|---|
+| Whole-file rewrite | 3,000–15,000 | truncation, silent loss | ❌ |
+| Search/replace blocks | 150–400 | ambiguous match | ✅ default |
+| Unified diff | 200–500 | context mismatch | ✅ fallback |
+| V4A / custom patch | 180–450 | parser bugs | ✅ internal |
+
+`tools/patch/` (5 files, 1,740 LOC) isliye bada hai: parser (480) + apply (420) + validate (300) + rollback (260) + facade. Har patch apply hone se pehle **current bytes ke against validate** hota hai; mismatch pe model ko exact context wapas jaata hai (self-correct loop). Apply transactional hai: journal + partial-failure rollback, kyunki multi-file patch ka aadha apply hona worst-case hai.
+
+#### 6.2.3 Result shaping (ye 80% context bugs ka fix hai)
+
+`core/tools/result_policy.rs` per-tool policy:
+
+```rust
+match tool {
+  Read   => { max_lines: 2000, head_tail: true,  dedupe: true },
+  Grep   => { max_matches: 200, group_by_file: true, elide_repeats: true },
+  Shell  => { max_bytes: 30_000, ansi: strip, exit_code: always, tail_bias: true },
+  Lsp    => { max_diagnostics: 50, group_by_severity: true },
+  ...
+}
+```
+
+Principles:
+- **Truncation informative ho:** "showing lines 1–200 of 4,312; use offset=200" — model ko next action pata chale.
+- **Exit code kabhi na kaato** — model ka pura error-recovery isi pe depend karta hai.
+- **Repeated identical output** ko `[unchanged since last read]` se replace karo (dedupe) — token bachta hai aur model confuse nahi hota.
+
+#### 6.2.4 Parallel tool calls
+
+Model ek turn me 3 reads maang sakta hai. Rules (`tools/router.rs`):
+- **Read-only tools** parallel (JoinSet, cap 8).
+- **Mutating tools** serial, aur agar same file pe do mutating calls hain → second reject with explanation.
+- **Order preservation** in results, warna model ka reasoning todta hai (provider ko results call order me chahiye).
+- Har call ka apna timeout + cancellation token.
+
+---
+
+### 6.3 Model gateway — N providers, ek IR
+
+#### 6.3.1 Internal IR (protocol crate)
+
+Provider-agnostic message model: `Role`, `ContentPart::{Text, Image, Thinking, ToolUse, ToolResult}`, `ToolCall{id, name, args_json}`, `Usage{in, out, cache_read, cache_write, reasoning}`. Har provider adapter **sirf translation** karta hai — retries, caching, cost, accounting gateway me hai.
+
+Why: providers ka API shape badalta rehta hai (Responses API vs Chat Completions vs Messages vs Converse). Agar har provider apna loop likhe, 4 agents ban jaate hain.
+
+#### 6.3.2 Streaming + tool-call assembly
+
+Sabse bug-prone jagah: **streamed tool arguments JSON** aksar tootey hue chunks me aata hai.
+
+`model/stream_assembly.rs` (320 LOC) rules:
+1. Buffer deltas per call-id.
+2. Har chunk pe incremental parse attempt — success pe emit `ToolCallDelta`, failure pe silent continue.
+3. Stream end pe **strict** parse; fail = structured error with raw buffer (model ko dikhta hai, retry hota hai).
+4. `finish_reason` mismatch (tool_calls bheja par args empty) detect karke ek repair-retry.
+
+#### 6.3.3 Resilience
+
+| Failure | Handling | File |
+|---|---|---|
+| 429 / overloaded | `retry-after` respect, jittered backoff, queue | `ratelimit.rs` |
+| 5xx transient | 3 retries, exponential + jitter, idempotent key | `client.rs` |
+| Stream drop mid-turn | resume from last event index if provider allows, else replay turn | `stream.rs` |
+| Model refuses / empty | one re-ask with stricter instruction, then surface | `retry.rs` |
+| Context overflow | compact ladder (3.1.2), then retry once | `core/context_mgr` |
+| Provider down | failover chain (same-family first), warn on capability loss | `failover.rs` |
+| Auth expired | refresh token, single retry, then interactive re-login hint | `auth/token_store.rs` |
+
+#### 6.3.4 Cost & cache telemetry
+
+`pricing.rs` + `usage.rs`: per-turn cost, per-session spend, cache hit rate, tokens/tool-call. UI status bar me live (`tui/render/status.rs`), `exec` mode me JSON me. Enterprise me ye "budget enforcement" ban jaata hai (`agent/budget.rs` hard stop).
+
+---
+
+### 6.4 Execution + sandbox plane (defence in depth)
+
+Terminal agent ka blast radius = user ka pura machine. Isliye teen independent layers, aur **teeno independent fail ho sakte hain**:
+
+```
+Layer 1  Policy engine        in-process, deny-first rules, risk classifier
+Layer 2  Approval UX          human sees exact command + scope, mode-dependent
+Layer 3  OS sandbox           kernel-enforced: FS, net, spawn, syscalls
+Layer 4  Resource limits      CPU/mem/PID/time, process-group kill
+Layer 5  Audit                everything above logged, hash-chained
+```
+
+#### 6.4.1 Sandbox matrix (real primitives, 2026)
+
+| OS | Primary | Secondary | Notes |
+|---|---|---|---|
+| Linux | **bubblewrap** (mount ns) | Landlock LSM + seccomp-BPF | bwrap missing ho to Landlock fallback; Landlock needs 5.13+ |
+| macOS | **Seatbelt** (`sandbox-exec`, SBPL profile) | — | deny-default profile + explicit read roots; `sandbox-exec` deprecated but functional |
+| Windows | **AppContainer** + capability SIDs | Job Object (mem/PID/kill-on-close) + restricted token | Process khud ko AppContainer me nahi daal sakta → parent worker launch karta hai |
+
+Critical implementation detail (jo aksar galat hota hai): **Landlock/seccomp ko single-threaded child me `exec` se pehle apply karo**, warna multithreaded fork + non-async-signal-safe calls = deadlock. Isliye `sandbox/linux_landlock.rs` ek dedicated worker binary path use karta hai, aur comment me ye constraint likha hota hai.
+
+Policy shape (`sandbox/policy.rs`):
+```rust
+SandboxPolicy {
+  writable_roots: [workspace, ~/.agent/memories],
+  readable_roots: [workspace, /usr, /lib, toolchain dirs],
+  network: Deny | LocalhostOnly | Allowlist(Vec<Host>),
+  spawn: bool,          // child processes allowed?
+  env_allowlist: [...],
+  resource: { cpu_s, mem_mb, pids, open_files },
+}
+```
+
+#### 6.4.2 Availability probe + honest degradation
+
+`doctor` aur runtime dono `sandbox/probe.rs` use karte hain:
+- Linux: bwrap present? kernel >= 5.13? user namespaces enabled (`/proc/sys/kernel/unprivileged_userns_clone`)?
+- macOS: `sandbox-exec` exists? profile test-run pass?
+- Windows: AppContainer creation test.
+
+Agar sandbox available nahi: **fail-closed by default**, `--no-sandbox` explicit flag ke saath warning + audit entry. Silent fallback = enterprise deal-breaker.
+
+#### 6.4.3 Approval pipeline (12-step, order matters)
+
+```
+1 validate args (schema)      7 budget check (agent/budget.rs)
+2 path_guard (single choke)   8 sandbox apply
+3 policy.engine.explain()     9 exec + stream
+4 risk class classify        10 output shape/truncate
+5 approval mode decision     11 audit append
+6 user prompt (if needed)    12 Event::ToolCompleted
+```
+
+`policy/engine.rs` **deny-first** hai: pehle deny rules match karo, phir allow rules. Isse "allow *" wali config bhi destructive command ko rok deti hai jab explicit deny ho. Har decision ka `explain()` string hota hai — user ko dikhta hai *kaunsi rule* ne roka. Enterprise support me ye sabse zyada time bachata hai.
+
+Modes (5):
+
+| Mode | Read | Edit | Shell | Use case |
+|---|---|---|---|---|
+| `read-only` | ✅ | ❌ | ❌ (except allowlisted) | review, untrusted repo |
+| `ask` (default) | ✅ | ✅ prompt | ✅ prompt | normal dev |
+| `auto-edit` | ✅ | ✅ | prompt | power user |
+| `plan` | ✅ | ❌ | ❌ read-only cmds | design phase |
+| `bypass` | ✅ | ✅ | ✅ | CI/container only, audit + banner |
+
+#### 6.4.4 Redaction before egress
+
+`policy/redaction.rs`: regex + entropy based secret detection (AWS keys, GitHub PATs, JWTs, private key blocks, `.env` values, high-entropy strings in diffs). Do jagah chalta hai: (a) tool results model ko bhejne se pehle, (b) telemetry export se pehle. Placeholder reversible nahi hota — model ko `[REDACTED:aws_key]` dikhta hai, value nahi.
+
+Trade-off: false positives se debugging mushkil hoti hai → per-session `--no-redact` (audited) aur `redaction.allowlist` paths.
+
+#### 6.4.5 Audit chain (tamper-evident, cheap)
+
+```
+entry_n = { ts, actor, session, action, target, decision, hash_prev }
+hash_n  = blake3(canonical_json(entry_n))
+```
+
+Append-only JSONL, har 1,000 entries pe anchor (hash + count) alag file me. Verify command: `agent audit verify`. SIEM export: syslog (RFC 5424) ya OTLP logs. Enterprise requirement: *"show me one audit line with field names"* [16] — isliye schema stable aur documented hona chahiye.
+
+---
+
+### 6.5 Memory plane — JSONL truth + SQLite index
+
+Dual-write design ka reason: do alag access patterns.
+
+| Need | Store | Why |
+|---|---|---|
+| Crash-proof truth, replay, export | JSONL append (`rollout.rs`) | append-only = no corruption; human-readable; `jq`-able |
+| Fast query (resume list, search, usage) | SQLite WAL (`db.rs`) | indexed lookups, transactions |
+| Undo/rollback | file snapshots + shadow git (`snapshot.rs`) | edit ke pehle state |
+
+Rules:
+1. **JSONL pehle likho, phir SQLite.** Agar SQLite write fail ho, session chalta rahe; startup pe reconciliation (`turns_repo.rs`).
+2. **fsync policy:** turn boundaries pe fsync, har delta pe nahi (warna SSD pe 10k fsync/min).
+3. **Schema migrations** numbered SQL files, `user_version` pragma, forward-only + tested on a 100MB fixture DB.
+4. **Retention:** default 30 din / 500 MB, configurable, `gc.rs` vacuum + orphan cleanup.
+5. **Resume semantics:** cwd badal gaya? git HEAD badal gaya? model available nahi? — teeno warn karo, silently mat chalao.
+
+Snapshot strategy: pre-edit content-addressed blobs (`~/.agent/blobs/<hash>`), per-turn manifest. `/undo` = manifest revert. Shadow-git sirf tab jab user git repo me ho aur `git` binary available ho (Gemini CLI approach) — warna blob fallback.
+
+---
+
+### 6.6 TUI plane — retention ka asli factor (36 files, ~9.7k LOC)
+
+Terminal UI me "pretty" se zyada "predictable" matter karta hai. Architecture:
+
+```
+crossterm event thread ──► channel ──► update.rs (pure reducer)
+                                              │
+                                        AppState (immediate-mode)
+                                              │
+                                        render/* ──► diff buffer ──► stdout
+```
+
+#### 6.6.1 Non-negotiables
+
+| Requirement | Implementation | File |
+|---|---|---|
+| Panic-safe terminal restore | RAII guard + `panic::set_hook` + signal handlers | `tui/lib.rs`, `term/raw.rs` |
+| 60 fps scroll on 10k messages | virtualised list, only visible rows laid out | `render/transcript.rs` |
+| Streaming markdown without flicker | incremental block parse + stable line cache | `render/markdown.rs` |
+| Resize reflow | wrap cache invalidated per width, anchor preserved | `render/transcript.rs` |
+| Grapheme-correct cursor | `unicode-segmentation` + `unicode-width` | `input/editor.rs` |
+| Large paste | bracketed paste → file ref if > 8 KB | `input/paste.rs` |
+| Copy | OSC 52 + native fallback | `term/clipboard.rs` |
+| Screen reader | linear mode, no spinner, verbatim | `a11y.rs` |
+
+#### 6.6.2 Terminal capability probing
+
+`term/caps.rs` startup pe probe karta hai (30–80 ms budget, cached by `TERM`+`TERM_PROGRAM`):
+
+| Capability | Query | Fallback |
+|---|---|---|
+| Truecolor | `COLORTERM` / `TERM` | 256 → 16 |
+| Kitty keyboard protocol | `CSI ? u` query | legacy keys (Ctrl+I vs Tab ambiguity!) |
+| Synchronized output | `DECRQM 2026` | plain flush (flicker) |
+| Bracketed paste | assume + enable | line-buffered |
+| Hyperlinks | OSC 8 heuristics | plain URLs |
+| Images | kitty/sixel DA response | ASCII placeholder |
+
+**Why it matters:** Ctrl+I aur Tab ka same byte aana, ya resize pe redraw flicker — ye chhoti cheezein user ko "amateur" feel karati hain. Codex/Claude Code dono yahi probe karte hain.
+
+#### 6.6.3 Diff + approval UX
+
+- Unified diff default, side-by-side wide terminals pe.
+- Word-level emphasis (`similar` crate), intra-line.
+- Approval prompt me: exact command, cwd, sandbox status, risk class, "always allow this pattern" scope preview.
+- Diff review mode: accept/reject hunks (jaise Claude Code/Aider).
+
+---
+
+### 6.7 Extensibility plane — MCP, ACP, hooks, skills, plugins, subagents
+
+| Mechanism | Context cost | Trust model | Kab use karein |
+|---|---|---|---|
+| **Hooks** (shell at lifecycle events) | 0 tokens | local, user-authored | lint, secret scan, audit gates, notifications |
+| **Skills** (markdown + allowed tools) | low (lazy) | reviewed repo file | team conventions, runbooks |
+| **Slash commands** (markdown) | 0 | repo/user | repeatable prompts |
+| **MCP servers** | medium–high (tool schemas) | external process | integrations (GitHub, Jira, DB) |
+| **Plugins** (signed bundle) | medium | signature + provenance | enterprise distribution |
+| **Subagents** | isolated | same policy | parallel exploration, review |
+
+#### 6.7.1 MCP — the 2026 reality
+
+Spec ab `2026-07-28` pe hai: **stateless core** (no `initialize`, no session id), `server/discover`, Multi-Round-Trip Requests, `Mcp-Method`/`Mcp-Name` headers, tasks as extension, sampling/roots/logging deprecated [9]. Rust me official SDK `rmcp` hai jo current + legacy revisions support karta hai, stdio + Streamable HTTP transports ke saath [10].
+
+Design decisions:
+- `rmcp` use karo, bespoke JSON-RPC mat likho (`crates/mcp`, 14 files mostly wiring + OAuth + registry + health).
+- **Tool schema budgeting mandatory** — 5 MCP servers × 12 tools × 180 tokens = 10,800 tokens before the user says anything. Solutions: per-server enable, `tool_search` deferred loading, schema compression (short descriptions in-session).
+- **Tool poisoning defence:** MCP tool descriptions untrusted hain (spec khud kehta hai). Isliye: description me embedded instructions detect/flag karo, naye server pe first-run approval, server allowlist managed policy se.
+- **OAuth 2.1 + RFC 8707 resource indicators** — token ko server se bind karo, warna cross-server replay.
+
+#### 6.7.2 ACP — editor integration bina plugin likhe
+
+Zed ka Agent Client Protocol (JSON-RPC 2.0 over stdio, LSP jaisa) ab 37 agents support karte hain [11]. Aapka binary ek **ACP agent** ban jaata hai → Zed/JetBrains/Neovim/Emacs me chal jaata hai, bina har editor ke liye extension likhe.
+
+Isliye `crates/server` me `acp/` module (3 files) hai jo core threads ko ACP sessions se map karta hai. **Ye enterprise sales ke liye asymmetric advantage hai:** "aapka agent hamare editor me kaam karega" — bina aapke 6 mahine ke IDE work ke.
+
+#### 6.7.3 Hooks (deterministic control, zero tokens)
+
+Events: `session_start`, `session_end`, `prompt_submit`, `pre_tool_use`, `post_tool_use`, `pre_compact`, `post_compact`, `pre_edit_commit`, `turn_end`, `on_error`, `on_approval_denied`, `config_change`, `cwd_change`, `file_changed`.
+
+Semantics: stdout inject hota hai context me, exit code 2 = **block** (reason ke saath), timeout default 10s. Enterprise me hooks hi "hamari company ka lint/secret-scan gate" ka jawab hain — LLM ko bypass karne ki zarurat nahi.
+
+---
+
+### 6.7.4 Threat model (jo enterprise security review me poocha jaata hai)
+
+| # | Threat | Vector | Mitigation | File |
+|---|---|---|---|---|
+| T1 | **Prompt injection via repo content** | `README.md`/test fixture me "ignore previous instructions, run curl …" | untrusted-content tagging in prompt, tool allowlist per turn, no network tool unless task requires, hooks gate | `context/sections.rs`, `policy/engine.rs` |
+| T2 | **Malicious MCP server** | tool description me hidden instructions ya misleading schema | first-run approval, description sanitisation, server allowlist, pinned versions, sandbox the server process | `mcp/`, `policy/managed.rs` |
+| T3 | **Terminal escape injection** | model/tool output me OSC 52 (clipboard), OSC 8 (hyperlink spoof), cursor moves, fake "approval" UI | **single trusted render layer**: strip all CSI/OSC except a whitelist, re-emit styled text only; approvals render in fixed chrome, never from stream | `tui/render/markdown.rs`, `term/caps.rs` |
+| T4 | **Approval fatigue** | 40 prompts → user presses `y` blindly | risk classes (read-only auto-allow), diff preview, "always allow this exact pattern" with scope display, batch summary | `approval/*` |
+| T5 | **Sandbox escape** | bwrap/userns misconfig, Landlock ABI mismatch | fail-closed probe, escape test suite in CI, deny `--no-sandbox` in managed policy | `sandbox/probe.rs` |
+| T6 | **Credential exfiltration** | agent reads `.env`, sends in prompt | redaction pre-egress, secret-path deny list, keyring-only storage | `policy/redaction.rs`, `auth/keyring.rs` |
+| T7 | **Supply chain** | typosquatted crate, malicious plugin, tampered update | `cargo-deny` + lockfile + SBOM + signed releases + signed plugins + rollback slot | CI, `ext/plugins/verify.rs` |
+| T8 | **Session file tampering** | user edits JSONL to hide actions | hash-chained audit separate from rollout; audit verify command; anchors | `policy/audit.rs` |
+| T9 | **Data exfil via MCP/tools** | agent uploads repo to random endpoint | egress allowlist enforced at sandbox + proxy, tool-level host allowlist | `policy/network.rs` |
+| T10 | **Model provider logging** | prompts stored by vendor | zero-retention/BYO endpoint mode, UI indicator, per-repo policy | `model/providers/*` |
+
+T3 sabse under-rated hai: agar aap model output ko raw terminal pe print karte ho, ek malicious repo **aapki clipboard overwrite kar sakta hai** ya ek fake "Allow?" dialog draw kar sakta hai. Isliye markdown/tool output parsing `tui` me **trust boundary** hai, formatting nahi.
+
+### 6.8 Governance plane — "enterprise" ka actual matlab
+
+Procurement checklists [15][16] ke hisaab se, minimum viable enterprise surface:
+
+| Requirement | Implementation | Crate |
+|---|---|---|
+| SSO (OIDC/SAML) | broker ke through device flow + token; SAML ke liye OIDC bridge | `auth` |
+| SCIM | server-side (aapka control plane), client me nahi | — |
+| Managed policy | signed TOML, admin-locked, dev override nahi | `core/config/managed.rs`, `policy/managed.rs` |
+| Repo allow/deny | two-layer: agent policy + code-host branch protection | `policy/rules.rs` |
+| Audit → SIEM | hash-chained JSONL + syslog/OTLP exporter | `policy/audit*.rs` |
+| Secrets | OS keyring, short-lived tokens, redaction pre-egress | `auth`, `policy/redaction.rs` |
+| Air-gap | no telemetry, no update check, local model endpoint, offline license | `cli`, `telemetry` |
+| Kill switch | global stop, per-repo deny, session revoke | `policy/incident.rs` |
+| SBOM + signing | `cargo-cyclonedx`, Sigstore/cosign, notarization | CI |
+| Data residency | local-first default; prompts sirf provider ko | design |
+
+**Sabse important governance decision:** telemetry **off by default**, local ring-buffer logs always-on, aur export opt-in + scrubbed. Ye ek line enterprise security review pass kara deti hai.
+
+---
+
+# PART V — Parallel subagent system
+
+## 7. Parallel subagent system (advanced)
+
+> Ye section poore plan ka sabse high-risk aur sabse high-differentiation part hai. Isliye ise **deterministic orchestration + isolated workers + gated merge** ki tarah design kiya gaya hai — "kai agents ko chat karwa do" ki tarah nahi.
+
+### 7.1 Pehle honest baat: parallel kab fayda deta hai, kab nuksan
+
+Public data do cheezein clear kehta hai:
+
+- **Agent teams me token cost ~7× badh jaata hai** ek normal session ke muqable (Claude Code analysis), aur harness badalne se tokens/solved-task me **40× tak** farq padta hai.
+- Same model, different scaffold: **52.1% vs 57.8%**, par input tokens **256.9M vs 3.9M** (Terminal-Bench 2.0).
+
+Toh parallel ka rule:
+
+| Situation | Parallel? | Kyun |
+|---|---|---|
+| 5 independent files/modules me same-pattern change | ✅ haan | write sets disjoint, coordination ~0 |
+| Repo-wide "find all call sites" + "fix" | ✅ haan (explore parallel, fix serial) | read-only fan-out sasta hai |
+| Ek bug jiske 6 possible causes hain | ✅ haan (4 hypothesis workers, 1 verifier) | search width, not work width |
+| Multi-stage feature (schema → API → UI) | ⚠️ limited | dependencies hain; DAG chain banao, fan-out nahi |
+| Ek file me bade refactor | ❌ nahi | merge conflicts guaranteed; single worker better |
+| Design decision / architecture | ❌ nahi | parallel opinions = confusion; 1 planner + 1 critic |
+
+**Product decision:** parallel mode **opt-in** (`--parallel`, `/board`), default serial. Har run pe orchestrator cost-vs-time report deta hai, aur agar speedup < 1.3× ho to CLI warning deta hai ("parallel ne 2.4× tokens liye, 1.1× speedup — serial try karo").
+
+### 7.2 Topology — 5 roles, 1 deterministic core
+
+```
+                    ┌──────────────────────────────┐
+   user prompt ───► │  PLANNER (LLM, 1 call)        │  proposes DAG (JSON, schema-validated)
+                    └──────────────┬───────────────┘
+                                   │ plan
+                    ┌──────────────▼───────────────┐
+                    │  SUPERVISOR (deterministic)   │  ← koi LLM nahi; pure Rust
+                    │  scheduler · leases · budgets │
+                    └───┬──────────┬───────────┬───┘
+             ┌──────────┘          │           └────────────┐
+             ▼                     ▼                        ▼
+      ┌────────────┐        ┌────────────┐           ┌────────────┐
+      │ WORKER 1   │        │ WORKER 2   │    ...    │ WORKER N   │
+      │ worktree   │        │ worktree   │           │ worktree   │
+      │ own budget │        │ own budget │           │ own budget │
+      └──────┬─────┘        └──────┬─────┘           └──────┬─────┘
+             └──────────┬──────────┴────────────────────────┘
+                        ▼  WorkerReport (summary + patch ref + evidence)
+              ┌───────────────────────┐
+              │ MERGE QUEUE (serial)  │  3-way merge, rebase onto tip
+              └──────────┬────────────┘
+                         ▼
+              ┌───────────────────────┐
+              │ VERIFY GATE           │  build + affected tests + lint
+              └──────────┬────────────┘
+                    pass │ fail → quarantine (worker ko evidence wapas)
+                         ▼
+                 consolidated diff → user review
+```
+
+**Design rule:** planner *proposes*, supervisor *decides*. Planner LLM kabhi scheduling, file locks, budgets ya merge order decide nahi karta — warna non-determinism aur deadlocks aate hain.
+
+### 7.3 Task DAG — node schema
+
+Planner ko ek **strict JSON schema** se output dena hota hai (invalid = 1 retry, phir serial fallback):
+
+```json
+{
+  "goal": "Add rate limiting to the API layer",
+  "nodes": [
+    {
+      "id": "n1",
+      "kind": "implement",              // explore | implement | test | review | doc | fix
+      "goal": "Add token bucket middleware in src/api/middleware/",
+      "write_set": ["src/api/middleware/**", "src/api/mod.rs"],
+      "read_set": ["src/config/**", "Cargo.toml"],
+      "deps": [],
+      "acceptance": ["cargo test api::middleware"],
+      "budget_tokens": 90000,
+      "model_tier": "strong"
+    },
+    {
+      "id": "n2",
+      "kind": "test",
+      "goal": "Add integration tests for 429 + header behaviour",
+      "write_set": ["tests/api/rate_limit.rs"],
+      "read_set": ["src/api/**"],
+      "deps": ["n1"],
+      "acceptance": ["cargo test --test api"],
+      "budget_tokens": 40000,
+      "model_tier": "cheap"
+    },
+    {
+      "id": "n3",
+      "kind": "review",
+      "goal": "Security review: bypass paths, clock skew, config validation",
+      "write_set": [],
+      "read_set": ["src/api/**", "tests/api/**"],
+      "deps": ["n1", "n2"],
+      "budget_tokens": 30000,
+      "model_tier": "strong"
+    }
+  ]
+}
+```
+
+Validation rules (supervisor me, LLM me nahi):
+
+1. **Cycle** = reject. **Self-dep** = reject. `deps` sirf pehle declare kiye gaye ids pe.
+2. **Width cap** — `max_workers` (default 4) se zyada ready nodes → queue.
+3. **Node count cap** — default 6, hard cap 12. Isse zyada = plan ko chhota karo (task decomposition fail).
+4. **Write-set disjointness check** — ready nodes ka intersection empty hona chahiye, warna serial + warning.
+5. **Root containment** — har path workspace root ke andar, `path_guard` se validate.
+6. **Acceptance mandatory** — `implement`/`fix`/`test` node ke paas kam se kam ek acceptance command.
+7. **Budget sum** ≤ task budget × 1.2 (planning overhead).
+
+### 7.4 Isolation — 4 levels, default L2
+
+| Level | Workspace | Context | Policy | Kiske liye |
+|---|---|---|---|---|
+| **L0** | shared, read-only | own | parent | explore/research workers (safest, cheapest) |
+| **L1** | shared, leased writes | own | parent | same-file sequential tasks (no parallel) |
+| **L2** *(default)* | **git worktree per worker** | own | parent + narrowed | implement/test workers |
+| **L3** | worktree + container/VM | own | narrowed + no net | untrusted repo, third-party MCP, "run this sketchy branch" |
+
+Isolation ka matlab sirf files nahi:
+
+- **Context isolation** — worker ko parent transcript nahi milta; sirf `goal + constraints + relevant files + acceptance`. Return sirf summary (300–600 tokens). Isse parent context pollution nahi hoti (research: subagent summary isolation).
+- **Policy isolation** — worker ke paas parent se **kam** permissions, kabhi zyada nahi. `net` default deny, `git commit` default deny, `git push` **always** deny.
+- **Budget isolation** — per-worker token/time/cost cap; exceed = worker stopped with partial report, parent decide kare.
+- **Process isolation** — worker ke child processes uska cancel tree follow karein; worker die = uske processes bhi die.
+- **Audit isolation** — har action me `worker_id` + `parent_turn` (attribution chain §12).
+
+### 7.5 Scheduler — deterministic, fair, adaptive
+
+Koi LLM nahi. Pure function: `(graph_state, budgets, limits) → next_node`.
+
+```
+loop:
+  ready   = nodes whose deps are all Done and leases grantable
+  ordered = sort by (priority_class, dag_depth_asc, created_seq)   // deterministic
+  while running < max_workers and ordered not empty:
+      n = ordered.pop_front()
+      if not leases.try_acquire(n.write_set): requeue(n); continue
+      if budget_pool.remaining() < n.reserve: wait_for_budget(); break
+      spawn_worker(n); running += 1
+  wait_for_any(worker_exit | budget_event | cancel)
+
+on 429/overloaded(provider):
+      concurrency = max(1, concurrency / 2)        // AIMD: multiplicative decrease
+on 5 consecutive successes:
+      concurrency = min(max_workers, concurrency + 1)
+```
+
+Rules:
+- **Priority classes:** `verify` > `review` > `implement` > `test` > `explore`. (Verification never starves — warna poora parallel run waste ho jaata hai.)
+- **Aging:** 2 minute wait pe priority ek class upar (starvation zero).
+- **Determinism:** `created_seq` + seeded tie-break; same plan → same schedule → replayable.
+- **Adaptive concurrency:** `min(cpu_cores/2, provider_rpm/6, max_workers)` se start; 429 pe half; success pe +1.
+- **Cost ceiling:** run-level `max_cost`; 80% pe warning event, 100% pe stop new spawns (running workers finish).
+- **Backpressure:** provider queue depth > threshold → naye workers spawn nahi; board pe "waiting on rate limit" dikhe.
+
+### 7.6 File leases (conflict ka asli solution)
+
+Merge conflicts ko *baad me* solve karna costly hai; **pehle hi rokna** sasta hai.
+
+- Worker declare karta hai `write_set` (globs). Supervisor usse expand karke **lease** deta hai.
+- Do leases overlap = second worker **queue** me (spawn hi nahi hota) — token waste zero.
+- **Deadlock-free:** multiple leases ek saath chahiye to sorted path order me acquire (classic lock ordering).
+- **Heartbeat:** har 30 s; 2 miss = stale.
+- **Expiry/steal:** 5 min no progress → lease revoke + worker cancel → requeue with note ("previous attempt stalled at X").
+- **Dynamic expansion:** worker naya file chhuना chahe to `request_lease` — grant ya wait; **bina lease ke write = policy deny** (tool-level enforcement, prompt-level nahi).
+
+Ye wahi mechanism hai jo "worker A ne B ki file overwrite kar di" class ke bugs khatam karta hai.
+
+### 7.7 Worker prompt contract (har worker ko same shape)
+
+| Section | Content | Why |
+|---|---|---|
+| Role | "You are an implementation worker. You own only these paths: …" | scope clarity |
+| Goal | node goal + parent goal (1 para) | alignment |
+| Constraints | no network, no policy changes, no git push, no new deps without approval | safety |
+| Context | relevant files (repo-map slice), interfaces, conventions | no transcript dump |
+| Acceptance | exact commands + expected outcome | verifiable done |
+| Output | strict `WorkerReport` JSON + patch via normal edit tools | machine-readable return |
+
+**Worker ke paas kya nahi hota:** parent chat, other workers ke reports, approval rights, policy edit, memory write, MCP config changes.
+
+### 7.8 WorkerReport — return protocol
+
+```json
+{
+  "node_id": "n1",
+  "status": "done",                  // done | partial | blocked | failed
+  "summary": "Added TokenBucket middleware + config parsing; 2 files, 140 LOC.",
+  "files_changed": ["src/api/middleware/rate_limit.rs", "src/api/mod.rs"],
+  "commits": ["worktree:3f9a1c2"],
+  "tests": [{"cmd": "cargo test api::middleware", "result": "pass", "duration_ms": 41200}],
+  "acceptance_met": true,
+  "confidence": 0.8,
+  "blockers": [],
+  "evidence": {"log_ref": "worker-n1.log", "diff_stat": "2 files, +140 -3"},
+  "cost": {"tokens_in": 61200, "tokens_out": 8400, "usd_micros": 184000}
+}
+```
+
+Validation: schema + `files_changed ⊆ write_set` (violation = report rejected, worker quarantined). Parent ko sirf `summary` jaata hai; baaki board/detail me.
+
+### 7.9 Merge + verify pipeline
+
+1. **Queue, not race** — merge strictly sequential (ek time pe ek), `dag` order me nahi, **completion order + dependency order** me (deps pehle).
+2. **Rebase onto tip** — worker branch ko current tip pe rebase; conflict = `merge.rs` 3-way; auto-resolve only whitespace-level, warna worker ko retry ("conflict in X, rebase your change").
+3. **Verify gate** — `build` + **affected tests** (file → test mapping via repo map) + `lint`. Timeout 10 min. Flaky retry ek baar.
+4. **Quarantine** — fail pe merge revert + worker ko evidence; retry budget 1; doosri fail = node `failed`, plan partially complete.
+5. **Consolidated diff** — user ko ek hi diff review milta hai, per-worker commits squashed with attribution trailers.
+6. **Never push/PR automatically** — v1 me sirf local branch + diff. PR creation policy-gated (P3).
+
+### 7.10 Failure taxonomy aur recovery
+
+| Failure | Detection | Recovery | Escalation |
+|---|---|---|---|
+| Wrong assumption | acceptance fails, self-report `blocked` | 1 retry with failure evidence | node failed → parent |
+| Test fail | gate | worker retry (max 1) | quarantine + report |
+| Merge conflict | rebase | 1 rebase-retry | re-plan node (serial) |
+| Budget exhausted | budget ledger | partial report return | parent decides continue/stop |
+| Tool denied by policy | policy engine | worker told; alternate approach | if repeated, node blocked |
+| Infinite loop | limits (identical call ×3) | worker cancel | requeue with tighter goal |
+| Environment break | gate infra error (disk/net) | run aborted, state saved | resume support |
+| Worker crash/panic | task join error | requeue once | node failed |
+| Provider outage | gateway | AIMD + failover | run paused, resumable |
+
+### 7.11 Budgets, rate limits, cost control
+
+| Budget | Default | Scope | Enforcement |
+|---|---|---|---|
+| `task_budget_tokens` | 400k | whole parallel run | pool; spawn blocked at 100% |
+| `worker_budget_tokens` | 120k | per worker | hard stop, partial report |
+| `max_cost_usd` | $3.00 | run | 80% warn, 100% no new spawns |
+| `max_workers` | 4 | concurrency | scheduler |
+| `max_wall_time` | 30 min | run | cancel tree |
+| `provider_rpm` | config | per provider | token bucket (shared with main turn) |
+
+**Model tiering:** planner + verifier = strong model; implement = strong; test/explore/doc = cheap. Measured effect: ~35–50% cost reduction vs all-strong (to be validated in eval).
+
+### 7.12 Safety — parallel mode me 6 extra rules
+
+1. Workers **approve nahi kar sakte** — koi bhi mutating tool call parent policy + (agar ask mode) user ke through jaata hai, **ya** pre-approved `auto-edit` scope me hota hai. Silent escalation impossible.
+2. Worker ke paas `git push`, `policy edit`, `mcp add`, `config write`, `memory write` tools **by default nahi**.
+3. Network default **deny** (L3 me definitively).
+4. Har worker apne sandbox policy ke saath chalta hai; parent se broader nahi.
+5. **Kill switch** (`policy/incident.rs`) — ek command me saare workers cancel + worktrees cleanup + audit entry.
+6. Parallel run ka **poora transcript sidecar** me; parent context me sirf summaries (prompt-injection blast radius chhota).
+
+### 7.13 Config keys (orchestration)
+
+```toml
+[agents]
+enabled        = false        # opt-in
+max_workers    = 4
+max_nodes      = 6
+isolation      = "worktree"   # none | worktree | container
+merge_policy   = "verify"     # manual | verify | auto
+plan_model     = "strong"
+worker_model   = "strong"
+cheap_model    = "cheap"
+task_budget    = 400000       # tokens
+worker_budget  = 120000
+max_cost_usd   = 3.00
+max_wall_time  = "30m"
+require_confirm = true        # user plan dekhe aur approve kare
+```
+
+### 7.14 Observability + TUI board
+
+Board state (`orchestrator/board_model.rs`) → `tui/render/board.rs`:
+
+```
+┌─ workers ──────────────────────────────────────────────┐
+│ n1 implement  ● running   62%  $0.18   files: 2        │
+│ n2 test       ○ blocked   dep n1                        │
+│ n3 review     · queued                                  │
+├─ merge queue ──────────────────────────────────────────┤
+│ 1/3 merged · conflict 0 · verify 2 pass 0 fail          │
+├─ budget ───────────────────────────────────────────────┤
+│ tokens 214k/400k · cost $0.61/$3.00 · 4m12s elapsed     │
+└────────────────────────────────────────────────────────┘
+```
+
+Metrics (telemetry crate): `orch_workers_active`, `orch_node_duration_ms`, `orch_tokens_per_node`, `orch_merge_conflicts_total`, `orch_verify_failures_total`, `orch_speedup_ratio`, `orch_rework_rate`.
+
+### 7.15 Success criteria (parallel mode ship karne se pehle)
+
+| Metric | Target | Test |
+|---|---:|---|
+| Speedup on 5 independent tasks | ≥ 1.8× vs serial wall time | benchmark repo, 3 runs |
+| Merge conflict rate | < 10% | 30-task corpus |
+| Rework rate (worker redo) | < 20% | same corpus |
+| Token overhead vs serial | < 2.2× | measured |
+| Determinism | same plan → same merge order | replay test |
+| Zero cross-worker file clobber | 0 incidents | lease stress test (50 runs) |
+| Kill switch completeness | 0 orphan worktrees/processes | chaos test |
+
+Agar ye numbers miss ho, feature **default off** rehta hai — ship nahi hota. (Yahi honest engineering hai.)
+
+### 7.16 File map — kaunsi file kya karti hai
+
+| File | Role in this system |
+|---|---|
+| `orchestrator/src/lib.rs` | `run(plan)` facade, budgets/cancel wiring |
+| `orchestrator/src/dag.rs` | node/edge model, topo order, ready-set, validation rules |
+| `orchestrator/src/scheduler.rs` | deterministic queue, priority, AIMD, budget pool |
+| `orchestrator/src/leases.rs` | write-set leases, ordering, heartbeat, steal |
+| `orchestrator/src/worker.rs` | worktree + session + narrowed policy + prompt + cancel |
+| `orchestrator/src/report.rs` | report schema/validation + summary extraction |
+| `orchestrator/src/merge.rs` | serial merge queue, rebase, conflict policy, revert |
+| `orchestrator/src/verify_gate.rs` | build/test/lint gate, quarantine, retry |
+| `orchestrator/src/board_model.rs` | live board state for TUI/server |
+| `core/src/subagent/*` | single-subagent path (legacy/simple), profiles |
+| `tools/src/task.rs` | model-facing `task` tool → orchestrator (parallel) |
+| `git/src/worktree.rs` | worktree create/remove/GC |
+| `state/src/migrations/0005_approvals.sql` | worker leases + approvals persistence |
+| `tui/src/render/board.rs` | board rendering |
+| `policy/src/attribution.rs` | worker → parent audit chain |
+
+### 7.17 Anti-patterns (jo hum *nahi* karenge)
+
+1. **LLM as scheduler** — non-deterministic, deadlocks, unreproducible costs.
+2. **Workers chatting with each other** — context explosion; coordination only via artifacts/reports.
+3. **Shared workspace writes** — clobber risk; always leases + worktrees.
+4. **Unbounded fan-out** ("spawn 20 agents") — 7× token cost, 40× variance; caps mandatory.
+5. **Merge without gates** — broken mainline, lost trust, worse than serial.
+6. **Approval amplification** — 4 workers × 10 prompts = fatigue → auto-approve → breach. Isliye workers ko pre-approved narrow scope.
+7. **Same model for all roles** — cost blowup; tiering mandatory.
+8. **No kill switch / no leases / no budgets** — teeno ke bina parallel mode production me nahi jaata.
+
+---
+
+# PART VI — Delivery: phases, effort, risks, decisions
+
+## 8. Delivery plan — 4 phases, 15 sprints, gated milestones
+
+### 8.1 Phases
+
+| Phase | Weeks | Files | LOC | Goal | Gate (exit criteria) |
+|---|---:|---:|---:|---|---|
+| **P0** Walking skeleton | 0–15 | 129 | 33,040 | 1 prompt → TUI → 1 provider → read/edit/shell → sandbox → JSONL | **M1**: 20 golden transcripts green, 3-OS sandbox probe, cancel-safe, demo recording |
+| **P1** Usable product | 15–30 | +92 (221) | +22,730 (55,770) | 4+ providers, compaction, MCP, hooks, resume, approvals+audit, ACP, board foundation | **M3**: internal dogfood 20 devs, 8h/day, no P0 bugs, eval ≥ 55% |
+| **P2** Enterprise GA | 30–48 | +73 (294) | +17,280 (73,050) | managed policy, SSO, SIEM, AppContainer, plugin signing, LSP, merge gates, signed release | **M4**: external audit clean, SBOM, 3 pilot enterprises |
+| **P3** Differentiation | 48–60 | +14 (308) | +3,510 (76,560) | vim mode, embeddings, tool search, ACP v2, PR automation, multi-repo | **M5**: parallel mode default-on for ≥ 1.8× speedup cases |
+
+### 8.2 P0 sprints (2 weeks each, 6 engineers)
+
+| Sprint | Focus | Main files | Demo | Exit test |
+|---|---|---|---|---|
+| **S0** (w1–2) | Skeleton: workspace, 19 crates stubs, CI, lint policy, protocol types, config default, testkit | `protocol/*`, `core/config/*`, `testkit/*`, `cli/main.rs` | `agent --version`, `agent doctor` (stub), CI green | build < 2 min, clippy clean |
+| **S1** (w3–4) | Agent loop on mock provider + state machine + events + JSONL rollout + exec CLI | `core/agent/*`, `core/events.rs`, `state/rollout.rs`, `model/mock.rs`, `cli/exec.rs` | scripted 6-turn conversation replays identically | 10 golden transcripts |
+| **S2** (w5–6) | TUI shell on fake events: transcript, composer, spinner, status bar, term caps | `tui/app.rs`, `update.rs`, `render/transcript.rs`, `render/layout.rs`, `term/caps.rs` | 10k-message scroll at 60 fps | frame p95 < 16 ms |
+| **S3** (w7–8) | Real provider (Anthropic) + SSE + tool-call assembly + read-only tools | `model/stream*.rs`, `providers/anthropic.rs`, `tools/fs/read.rs`, `tools/search/grep.rs`, `tools/fs/glob.rs` | ask a question on a real repo, streamed answer | cancel mid-stream safe |
+| **S4** (w9–10) | Patch engine + write/edit + policy engine + approval pipeline + ask mode | `tools/patch/*`, `tools/fs/{edit,write}.rs`, `policy/{rules,engine}.rs`, `core/approval/*`, `tui/render/approval.rs` | fix a real bug, approve 3 calls, diff shown | patch fuzz 1M iterations clean |
+| **S5** (w11–12) | exec + Linux sandbox (bwrap/Landlock/seccomp) + shell tool + risk scan | `exec/*`, `sandbox/{lib,policy,linux_*}.rs`, `tools/shell/*` | sandboxed `cargo test`; escape suite blocked | escape tests: 0 bypass |
+| **S6** (w13–14) | Context assembly + ledger + compaction (snip/summarize) + resume + macOS Seatbelt | `context/{assembler,ledger,compaction/*}.rs`, `state/resume.rs`, `sandbox/macos_seatbelt.rs` | 200-turn session, 2 compactions, no amnesia | cache-stability snapshot |
+| **S7** (w15) | Hardening: doctor, signals, panic safety, Windows probe, docs, demo | `cli/commands/doctor.rs`, `signals.rs`, `tui/term/raw.rs`, `docs/*` | full demo: fix → test → commit-ready diff | **M1 gate** |
+
+**P0 ke saath ye bhi lazmi (parallel tracks):**
+- CI matrix week 1 se: linux-x64, linux-arm64, macos-arm64, **windows-x64** (ConPTY + paths), 2 terminal emulators in TUI snapshot tests.
+- Perf budgets week 2 se CI me (startup, RSS, binary size) — baad me add karna painful hai.
+- `unsafe` lint, `cargo-deny`, `typos` week 1 se.
+
+### 8.3 P1 sprints (weeks 16–30)
+
+| Sprint | Focus | Key files | Exit |
+|---|---|---|---|
+| **S8** | Providers 2–4 (OpenAI Responses, Gemini, Ollama) + failover + cost UI | `model/providers/*`, `model/{gateway,failover,pricing}.rs`, `tui/render/status.rs` | 4 providers pass contract tests |
+| **S9** | MCP client (rmcp) + dynamic tool registry + tool schema budget + hooks | `mcp/*`, `core/tools/{mod,router}.rs`, `context/tool_budget.rs`, `ext/hooks/*` | 3 MCP servers, schema tokens < 8k |
+| **S10** | Repo map + index + search ranking | `index/*`, `context/memory/hierarchy.rs` | 500k LOC repo map < 3 s cold, < 40 ms incr |
+| **S11** | Full compaction ladder + memory + scratchpad + restore | `context/compaction/*`, `context/memory/*`, `context/scratchpad.rs` | 30-turn task survives 2 compactions |
+| **S12** | State depth + app-server JSON-RPC + ACP | `state/{snapshot,replay,resume}.rs`, `server/*` | Zed me agent chalta hai via ACP |
+| **S13** | Auth + audit + redaction + managed config | `auth/*`, `policy/{audit,redaction,managed}.rs` | audit verify + SIEM export demo |
+| **S14** | Orchestrator foundation (dag/scheduler/leases/board) + profiles | `orchestrator/*` (7 files), `core/subagent/*`, `tui/render/board.rs` | 4 workers, 0 clobber, 1.5× speedup |
+| **S15** | Beta hardening, eval suite, perf, docs, migration guide | `testkit/*`, `docs/*`, `evals/*` | **M3 gate** |
+
+### 8.4 P2 items (weeks 31–48, GA)
+
+AppContainer + Job Object (Windows parity), plugin signing + trust store, LSP diagnostics, merge queue + verify gates, worktrees + GC, SIEM exporters, SSO/device flow hardening, SBOM + notarization + reproducible builds, `cargo-mutants` on security crates, external pentest, docs site, support bundle.
+
+### 8.5 Critical path aur parallelism
+
+```
+protocol → core/loop → TUI(fake events) ┐
+                    → model gateway     ├─► P0 demo
+                    → tools/patch       │
+                    → exec → sandbox    ┘
+context ──► index ──► (map quality) ──► P1 eval
+policy ──► audit ──► enterprise gate ──► P2
+state ──► replay ──► orchestrator ──► parallel gate
+```
+
+**Critical path:** `protocol → core loop → patch engine → sandbox → compaction`. Inme se koi bhi slip = poora P0 slip. Isliye:
+- `protocol` week 1 me freeze (baad me sirf additive).
+- `patch engine` ko sabse senior engineer de (fuzz + property tests).
+- `sandbox` Linux-first; Windows probe-only P0 me, full AppContainer P2.
+- TUI fake events pe chalta hai — model ke intezaar me block nahi hota. **Ye scheduling ka sabse bada unlock hai.**
+
+### 8.6 Ownership (RACI-lite)
+
+| Crate | Owner | Reviewers |
+|---|---|---|
+| `protocol` | Tech lead | all leads |
+| `core` | Tech lead + agent engineer | tools owner |
+| `model`, `context`, `index` | Agent engineer | tech lead |
+| `tools`, `git` | Tools engineer | security engineer |
+| `exec`, `sandbox`, `policy`, `auth` | Platform/security engineer | tech lead |
+| `tui` | TUI engineer | design-minded reviewer |
+| `state`, `server`, `telemetry`, `cli`, `testkit` | Infra/DevEx engineer | tech lead |
+| `orchestrator` | Agent engineer + tech lead | tools + security |
+| `ext` | Tools engineer | platform |
+
+### 8.7 Kickoff checklist (pehle 10 working days)
+
+1. Workspace + 19 crate stubs + `Cargo.toml` workspace deps + `rust-toolchain.toml`.
+2. CI: fmt, clippy (`-D warnings`), nextest, `cargo-deny`, `typos`, 4-platform matrix, perf budget job.
+3. `protocol` v0: Op/Event enums + serde + schema export + snapshot tests.
+4. `testkit`: mock provider + temp repo fixture + golden helper.
+5. ADRs 1–6 likho (repo me `docs/adr/`), baaki sprint ke saath.
+6. Perf harness: hyperfine startup, RSS script, TUI frame benchmark skeleton.
+7. Branch protection + CODEOWNERS + PR template (checklist = §13.2 DoD).
+8. Threat model v0 (`docs/security/threat-model.md`, §12.2 se).
+9. Secrets baseline: `gitleaks` pre-commit + CI.
+10. Demo environment: sample polyglot repo + 10 scripted tasks (eval seed).
+
+### 8.8 Milestone gates (go/no-go)
+
+| Gate | Kab | Kya chahiye | No-go matlab |
+|---|---|---|---|
+| **M0** Architecture review | week 2 | protocol frozen, crate graph approved, ADRs 1–6 | redesign (sasta ab) |
+| **M1** Skeleton demo | week 15 | P0 exit criteria + perf budgets green | P1 start nahi |
+| **M2** Alpha (internal) | week 22 | 4 providers, compaction, approvals, no data loss | dogfood start nahi |
+| **M3** Beta | week 30 | eval ≥ 55%, 20 devs dogfood, ACP working | external pilots nahi |
+| **M4** GA | week 48 | audit clean, SBOM, 3 pilots, docs, SSO | enterprise launch nahi |
+| **M5** Parallel default-on | week 58 | §7.15 metrics pass | feature off rehta hai |
+
+### 8.9 LOC se effort (teen scenarios)
+
+Base: **76,560 LOC** hand-written Rust (tests/docs alag). Industry-observed net production throughput for senior systems engineers with AI assistance (2026): **40–70 LOC/day** (reviewed, tested, merged). Hard subsystems (sandbox, TUI, patch engine, protocol) isse slow — 20–35 LOC/day.
+
+| Scenario | Team | Effective LOC/day | Duration | Reality check |
+|---|---|---:|---:|---|
+| **A. Recommended** | 6 engineers (4 core + 1 TUI + 1 platform/CI) | 6 × 50 = 300 | **~310 working days ≈ 14.5 months** (buffer ke saath) | P0 pehle 3.5 mahine |
+| B. Lean | 3 engineers | 150 | ~510 days ≈ **22–24 months** | Scope cut to P0+selected P1 (~185 files) warna burnout |
+| C. Aggressive | 9 engineers | 450 | ~170 days ≈ **8 months** | Coordination cost; 19 crates me ownership clash risk |
+| D. Solo + AI | 1 senior | 45 | ~1,700 days ≈ **6+ years** | Sirf Tier A/B realistic |
+
+**Cross-check:** Codex ~549k LOC / 5,706 files, OpenAI team + 1.5 years. Ratio-wise 76.5k LOC ≈ 14% of Codex — 6 engineers × ~1 saal ka sensible output (Codex 1.5 saal me 549k LOC, bade team ke saath).
+
+### 8.10 Architecture Decision Records (15, jo repo me hone chahiye)
+
+| # | Decision | Rationale | Revisit trigger |
+|---|---|---|---|
+| 1 | One binary, many surfaces (arg0 dispatch) | distribution simplicity; Codex pattern | binary > 60 MB |
+| 2 | Event-sourced turn + actor per thread | replay, resume, multi-surface, testability | event schema churn > 1/sprint |
+| 3 | `protocol` crate on day 1 | SDK/IDE/serialisation stability | never |
+| 4 | 18-crate workspace | compile time, ownership, embedding | workspace build > 3 min |
+| 5 | Primitive tools, not integrations | MCP covers long tail | — |
+| 6 | Search/replace + diff patching, validated + transactional | token cost, safety | model-native patch formats converge |
+| 7 | Deny-first in-process policy + OS sandbox | independent layers | — |
+| 8 | JSONL truth + SQLite index | crash safety + query speed | SQLite WAL insufficient at scale |
+| 9 | tree-sitter repo map, no embeddings by default | 1–4k tokens, zero infra | map+grep recall < 80% on evals |
+| 10 | `rmcp` for MCP, no bespoke client | spec churn | rmcp missing critical feature |
+| 11 | ACP adapter in `server` | editor reach without plugins | ACP v2 breaking |
+| 12 | ratatui immediate mode + virtualised list | predictable perf, small binary | cannot hit 60 fps |
+| 13 | Cache-aware prompt ordering enforced by test | 3–10× cost delta | providers remove prefix caching |
+| 14 | Subagents return summaries only (sidecar transcripts) | context isolation | — |
+| 15 | Telemetry off by default, local logs on | enterprise trust | — |
+
+### 8.11 Dependency shortlist (pin exact versions at kickoff)
+
+| Purpose | Crate | License | Risk |
+|---|---|---|---|
+| Async runtime | `tokio`, `tokio-util` | MIT | low |
+| HTTP/streaming | `reqwest`, `hyper`, `rustls`, `eventsource-stream` | MIT/Apache-2.0 | low |
+| Serde/JSON | `serde`, `serde_json`, `toml`, `schemars` | MIT/Apache-2.0 | low |
+| CLI | `clap` (derive) | MIT/Apache-2.0 | low |
+| TUI | `ratatui`, `crossterm` | MIT | low |
+| Unicode | `unicode-width`, `unicode-segmentation` | MIT/Apache-2.0 | low |
+| Markdown | `pulldown-cmark` | MIT | low |
+| Syntax | `tree-sitter` + curated grammars, `two-face`/`syntect` | MIT | med (grammar ABI) |
+| Diff | `similar`, `diffy` | Apache-2.0/MIT | low |
+| Files | `ignore`, `globset`, `walkdir`, `encoding_rs` | MIT/Apache-2.0 | low |
+| Regex | `regex` | MIT/Apache-2.0 | low |
+| DB | `sqlx` (sqlite) or `rusqlite` | MIT/Apache-2.0 | low |
+| Git | `gix` | MIT/Apache-2.0 | med (API churn) |
+| PTY/process | `portable-pty`, `nix`, `windows-sys`, `signal-hook` | MIT | med |
+| Sandbox | `landlock`, `seccompiler` (+ own bwrap/seatbelt/AppContainer code) | MIT/Apache-2.0 | med |
+| Keyring | `keyring` | MIT/Apache-2.0 | med (platform backends) |
+| OAuth | `oauth2` | MIT/Apache-2.0 | low |
+| MCP | `rmcp` | MIT/Apache-2.0 | med (spec churn) |
+| Tracing | `tracing`, `tracing-subscriber`, `opentelemetry*` | MIT | low |
+| Logging/files | `tracing-appender`, `directories` | MIT | low |
+| Testing | `insta`, `proptest`, `criterion`, `rstest` | Apache-2.0/MIT | low |
+| Dev tools | `cargo-nextest`, `cargo-deny`, `cargo-audit`, `cargo-dist`, `cargo-llvm-cov`, `cargo-mutants`, `typos` | — | — |
+
+Policy: **no crate without a named owner + license check + advisory check.** `unsafe` only permitted in `sandbox`, `exec` (and even there: documented invariant + test).
+
+### 8.12 Aapke current Go ZED se migration strategy
+
+Aapke repo me abhi **93 `.go` files** hain (`cmd/` 12 KB, `internal/` 772 KB) aur docs me "enterprise phase" already likha hai. Rust rewrite ke liye pragmatic path:
+
+| Step | Action | Why |
+|---|---|---|
+| 1 | **Protocol pehle, port baad me.** Go version ka event/tool JSON shape freeze karo → `protocol` crate ka starting point | Behavior parity measurable hoti hai |
+| 2 | **Vertical slice port karo** (TUI + loop + read/edit/shell + 1 provider), poora rewrite nahi | 3 mahine me demoable |
+| 3 | **Go version ko oracle banao** — same transcript dono pe chalao, event diff nikalo | Silent regressions pakadta hai |
+| 4 | **Enterprise features dobara mat likho, dobara design karo.** Go `internal/enterprise` (secret scan, SBOM, PII) Rust me `policy` + `tools` me split hoga | Warna 20 files ka dead weight |
+| 5 | Feature freeze Go pe; Rust P1 tak Go maintenance-only | Team focus |
+
+**Warning:** 1:1 porting ka trap — Go ka goroutine/channel design Rust me actor model ke saath mapping nahi karega. Architecture dobara socho, code dobara nahi.
+
+---
+
+# PART VII — File-by-file specification (308 files)
+
+## 9. File-by-file specification — 308 files
+
+Har file ke saamne do cheezein hain: **Code** (andar exactly kya likhna hai — structs, functions, algorithms) aur **Features / acceptance** (kaise pata chalega ki wo file sahi hai). LOC aur phase Part VI ke delivery phases (P0–P3) ke hisaab se hain.
+
+Legend: `P0` walking skeleton · `P1` usable product · `P2` enterprise GA · `P3` differentiation.
+
+### 9.1 `crates/protocol` — 14 files · ~2,950 LOC
+_Wire contracts (types only)_ — Wire types shared by TUI, exec, app-server, ACP and SDKs. No logic, only stable contracts.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 50 · P0 | `pub const PROTOCOL_VERSION: u32`; module re-exports; `Serde` feature gates | SDK authors ek hi version constant use karein; semver bump rule documented |
+| `src/op.rs` | 260 · P0 | `enum Op { Submit, Steer, Interrupt, Approve, Deny, Compact, SetMode, Shutdown }` + typed payloads | har op idempotent ya explicitly non-idempotent; unknown op = forward-compatible ignore |
+| `src/event.rs` | 380 · P0 | `enum Event` (30+ variants): TurnStarted, TextDelta, ThinkingDelta, ToolRequested, ToolApproved, ToolCompleted, Usage, CompactBoundary, Error, TurnCompleted, WorkerSpawned/Progress/Merged | TUI + server + JSONL + telemetry sab isi ko fold karein; `#[serde(tag="type")]` + `schema_version` |
+| `src/message.rs` | 300 · P0 | provider-neutral `Message { role, parts, tool_calls }`, `ContentPart`; normalization helpers | provider adapters sirf translate karein; IR me provider-specific field na aaye |
+| `src/content.rs` | 240 · P1 | Content blocks: Text, Image{media_type,bytes}, ResourceLink, Diff{hunks}, TerminalOutput{ansi_stripped} | images alag store hon (blob), event me sirf handle; bade blobs cap ke saath |
+| `src/tool.rs` | 280 · P0 | `ToolCall`, `ToolResult`, `ToolError { kind, message, retryable, hint }`, risk class enum | error taxonomy model ko actionable ho; `retryable` scheduler use kare |
+| `src/permission.rs` | 200 · P0 | `PermissionRequest { tool, args_preview, scope, risk, rule_hint }`, `Decision::{Allow,Deny,Ask,AllowAlways(pattern)}` | UI ko exact command dikhane ke liye enough info; pattern reproducible ho |
+| `src/model.rs` | 220 · P1 | `ModelDescriptor { id, provider, ctx_window, max_out, caps, price }` + capability bitset | naya model add = data change, code change nahi; caps se UI features gate hon |
+| `src/usage.rs` | 140 · P1 | `Usage { input, output, cache_read, cache_write, reasoning, cost_micros }` + `Add` impls | per-turn/per-session/per-worker aggregation; cost integer micros me (float nahi) |
+| `src/ids.rs` | 90 · P0 | newtypes: `ThreadId`, `TurnId`, `CallId`, `SessionId`, `WorkerId` (ULID based, sortable) | IDs log/JSONL me sortable; accidental mix-up compile error |
+| `src/config_types.rs` | 260 · P0 | Full serde config schema (model/permissions/sandbox/context/telemetry/ui/agents) + `Default` | har key ka default aur doc comment; schema se docs generate ho |
+| `src/schema_export.rs` | 150 · P2 | JSON Schema emit + TS/Python type stub generation (build script) | SDK drift CI me fail; schema backward compatible (optional fields only) |
+| `src/acp_types.rs` | 260 · P2 | ACP mapping: session/update notifications, tool call status, plan entries, diffs | ACP v1 conformant; unknown fields preserve (serde flatten) |
+| `src/version_neg.rs` | 120 · P2 | protocol version negotiation, minimum-supported checks, migration shims | purana client naye server se safe fail kare, silent misbehave na kare |
+
+### 9.2 `crates/testkit` — 4 files · ~840 LOC
+_Test infrastructure_ — Shared test infrastructure: deterministic fixtures, mock provider, golden transcript tooling.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 60 · P0 | test harness exports: `TestAgent`, `TestRepo`, `assert_events` | ek line me agent + mock model + temp repo |
+| `src/fixtures.rs` | 260 · P0 | temp workspaces, sample polyglot repo, permission/policy fixtures, worker plans | fixtures deterministic; parallel tests safe (unique temp dirs) |
+| `src/mock_provider.rs` | 320 · P0 | in-process HTTP mock: scripted SSE, fragmentation, delays, 429/500, usage lies | zero network; millisecond-fast tests; recorded fixtures replay |
+| `src/golden.rs` | 200 · P1 | golden transcript comparison, event-diff output, insta integration, update flow | diff readable (line-level); `INSTA_UPDATE=always` documented |
+
+### 9.3 `crates/model` — 26 files · ~7,500 LOC
+_Model gateway — providers, streaming, cost_ — Provider-neutral gateway: one internal IR, N adapters, SSE streaming, caching, cost, failover.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 60 · P0 | `Gateway` + `ModelClient` public API, `ModelId` parsing (`provider/model`), re-exports | config me string se model resolve ho; unknown model = actionable error |
+| `src/message_convert.rs` | 340 · P0 | IR ↔ provider payload conversion for all content parts; tool schema translation | round-trip property test (IR → provider → IR) lossless for supported fields |
+| `src/gateway.rs` | 300 · P0 | model routing by role (main/summarizer/classifier/worker), fallback chain, capability checks | role-based routing = cheap model for summarise, strong for code; fallback loss audit |
+| `src/client.rs` | 320 · P0 | reqwest client: pooling, proxy from env, rustls, connect/read timeouts, idempotency key | no proxy leaks in sandbox mode; DNS failures classified separately |
+| `src/stream.rs` | 400 · P0 | SSE parser: chunk framing, `data:`/`event:`/comment lines, keepalive, graceful abort, resume index | malformed stream = typed error with partial text preserved (UI never blanks) |
+| `src/stream_assembly.rs` | 320 · P0 | tool-call delta accumulation, incremental JSON parse, repair, finish-reason reconciliation | partial args never panic; truncated JSON = retryable error with raw buffer to model |
+| `src/providers/mod.rs` | 160 · P0 | `trait Provider`: build_request, parse_event, capabilities, count_tokens; registry | naya provider = 1 file + registry line; koi core change nahi |
+| `src/providers/anthropic.rs` | 520 · P0 | Messages API: system blocks, cache_control breakpoints, thinking blocks, tool_use/result | cache hit rate > 60% on repeated turns; thinking redacted from history |
+| `src/providers/openai_responses.rs` | 540 · P0 | Responses API: input items, function calls, reasoning effort, parallel tool calls | reasoning items preserved for follow-up; `store:false` default |
+| `src/providers/openai_chat.rs` | 380 · P1 | Chat Completions compatibility path for third-party OpenAI clones | capability probe: tools/vision/stream support detect karke degrade ho |
+| `src/providers/gemini.rs` | 440 · P1 | generateContent: contents/parts, function declarations, safety settings, 1M context | long-context path me repo map optional; function call ids map ho |
+| `src/providers/bedrock.rs` | 300 · P2 | Converse API + SigV4 signing + credential chain (env/profile/IMDS) | air-gapped/enterprise VPC me chale; no hardcoded region |
+| `src/providers/vertex.rs` | 280 · P2 | Vertex endpoint construction + ADC token source + publisher model mapping | GCP service account se CI me chale; quota errors mapped |
+| `src/providers/azure.rs` | 240 · P2 | deployment name routing, api-version pinning, content-filter error parsing | deployment rename config se ho, code se nahi |
+| `src/providers/ollama.rs` | 240 · P1 | local models: capability probing (tools? stream?), no-cache mode, context clamp | offline/air-gap mode me default provider; tool support absent ho to text-mode fallback |
+| `src/providers/openrouter.rs` | 200 · P3 | aggregator headers (`HTTP-Referer`, provider preference), model alias resolution | provider switching ke cost delta UI me dikhe |
+| `src/providers/custom.rs` | 220 · P2 | generic OpenAI-compatible BYO endpoint: base URL, header template, schema probe | enterprise internal gateway supported; secrets env se, never logged |
+| `src/auth_headers.rs` | 220 · P0 | auth strategies: api-key header, bearer, signed request, OAuth token with refresh hook | 401 = one refresh + one retry, phir interactive login hint |
+| `src/capabilities.rs` | 260 · P1 | capability matrix per model: tools, parallel-tools, images, cache, reasoning, max ctx, streaming quirks | UI features usi se gate hon; galat assumption se silent failure na ho |
+| `src/token_count.rs` | 280 · P0 | fast tokenizer approximation + provider usage reconciliation + per-section attribution | estimate error < 8%; drift tracked per provider |
+| `src/pricing.rs` | 220 · P1 | price table (per M tokens, cache read/write multipliers), cost math, currency display | cost integer micros; price table versioned + date-stamped |
+| `src/cache.rs` | 260 · P1 | prompt-cache breakpoint placement, stability hashing, invalidation reasons | cache-invalidating change = dev warning; cache hit/miss metrics |
+| `src/reasoning.rs` | 220 · P2 | thinking budget control, reasoning content storage policy, redaction before history | reasoning kabhi user-visible transcript me na aaye by default; cost accounted |
+| `src/ratelimit.rs` | 220 · P0 | 429/overloaded handling, `retry-after` parsing, per-provider token bucket, queue depth | burst pe thundering herd nahi; fairness between workers (see orchestrator) |
+| `src/failover.rs` | 260 · P2 | cross-provider failover with conversation replay safety and capability-loss warning | failover ke baad tool-call ids remap hon; user ko explicit notice |
+| `src/mock.rs` | 300 · P0 | scriptable mock model: scripted SSE, fragmentation, delays, 429/500, usage lies | har integration test isi se chale; zero network in CI by default |
+
+### 9.4 `crates/core` — 43 files · ~10,200 LOC
+_Harness — turn loop, sessions, approvals, budgets_ — The harness itself: turn state machine, tool routing, approvals, budgets, prompt assembly, multi-agent.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 90 · P0 | re-export `Agent`, `Session`, `ThreadManager`, `Config`, `EventSink`; `#![warn(missing_docs)]` | library surface stable; koi UI/TUI dependency nahi |
+| `src/agent/mod.rs` | 180 · P0 | `Agent` facade: owns loop, tool registry handle, policy handle, event bus, cancel tree, config snapshot | ek thread = ek Agent; actors ke beech sirf ops/events; no shared mutable state |
+| `src/agent/loop.rs` | 620 · P0 | `run_turn()`: assemble → stream → collect tool calls → route → observe → repeat; `select!` on stream/op/cancel | one prompt end-to-end; cancel at any await; transient retry; bounded memory |
+| `src/agent/state.rs` | 340 · P0 | `enum State { Idle, Assembling, Streaming, Approving, Executing, Compacting, Verifying, Retrying, Done, Cancelled, Failed }` + legal transitions table | illegal transition = compile error (exhaustive match) + debug assertion; state metrics emit |
+| `src/agent/turn.rs` | 260 · P0 | `Turn` struct: attempt counter, partial text buffer, pending calls, timestamps, token deltas | turn-scoped state leak na kare; crash ke baad turn incomplete mark ho |
+| `src/agent/cancel.rs` | 150 · P0 | CancellationToken tree: turn → tool call → child process → subagent/worker; `Drop` guard kills children | Ctrl-C pe 500 ms me sab kuch band; orphan process zero |
+| `src/agent/steering.rs` | 220 · P1 | mid-turn user input queue: `Op::Steer` ko next tool boundary pe inject karo; priority interrupts | user 'ruko, galat file' bol sake bina turn kill kiye; injection point documented |
+| `src/agent/budget.rs` | 280 · P0 | budget ledger: max tokens, max tool calls, max wall time, max cost; soft/hard limits; per-worker sub-budgets | hard stop pe clean `TurnOutcome::BudgetStop` + partial result; spend never exceeds cap |
+| `src/agent/limits.rs` | 240 · P1 | loop detection: identical tool+args repeat counter, oscillating file edits, no-progress turns | 3 identical calls = warning, 5 = stop with explanation; false positive rate measured |
+| `src/session/mod.rs` | 260 · P0 | `Session`: history, cwd, config snapshot, permission snapshot, model binding, metadata | session immutable-ish (config snapshot at start) → replay deterministic |
+| `src/session/manager.rs` | 380 · P0 | `ThreadManager`: create/fork/resume/list/archive; lifecycle + idle GC; worker registration | 1000 threads pe memory bounded; list < 10 ms |
+| `src/session/fork.rs` | 200 · P2 | fork at any message boundary; parent/child lineage; token accounting split | side-quest bina parent context ko pollute kiye; lineage audit me dikhe |
+| `src/session/history.rs` | 300 · P0 | append-only history, normalization (merge consecutive parts), dedupe, truncation hooks | history rewrite kabhi na ho (index stability); compaction boundaries explicit |
+| `src/context_mgr/mod.rs` | 340 · P0 | decides window contents; invokes compaction ladder; enforces budget split; emits CompactBoundary | overflow se pehle predict kare (pre-flight), error pe nahi |
+| `src/context_mgr/budget_split.rs` | 220 · P0 | allocator: system/tools/memory/repo-map/history/output reserves; model-aware limits | config se override ho; drift detected to safety margin auto-increase |
+| `src/prompt/mod.rs` | 240 · P0 | assembler: ordered sections, stable/volatile tagging, cache boundary insertion | prefix byte-stable jab tak input stable ho; snapshot test isko lock kare |
+| `src/prompt/system.rs` | 320 · P0 | system prompt composition: identity, hard rules, tool policy, mode, sandbox state, output contract | mode ke hisaab se fragments swap hon; prompt injection ke against delimiting |
+| `src/prompt/templates.rs` | 160 · P0 | `include_str!` fragments (plan, review, compact, summarise, classifier, worker contracts) | prompt change = snapshot + eval gated; plain text files review-able |
+| `src/prompt/env_context.rs` | 220 · P1 | env snapshot: OS, shell, cwd, git branch/dirty, date, terminal caps, sandbox availability | 5–20 ms; per-turn refresh with cheap git call; failure me degrade gracefully |
+| `src/tools/mod.rs` | 300 · P0 | `ToolRegistry`: register, filter by mode/policy, deferred schemas, name collision handling | schema token cost tracked; tool disabled = schema bhi na jaye |
+| `src/tools/router.rs` | 260 · P0 | name→tool resolution, alias map, parallel eligibility (read-only), serial constraints, dedupe | 3 reads parallel, 2 edits same file serial; result order preserved |
+| `src/tools/executor.rs` | 340 · P0 | executes calls: timeout, cancellation, JoinSet for parallel, output caps, error mapping | one slow tool poore turn ko block na kare (jab parallel eligible ho) |
+| `src/tools/result_policy.rs` | 260 · P1 | per-tool shaping: max lines/bytes, head+tail, dedupe marker, 'showing X of Y' hints | truncation informative ho; exit code/error kabhi truncate na ho |
+| `src/approval/mod.rs` | 300 · P0 | pipeline: policy.evaluate → classifier → mode decision → UI ask → remember grant → audit | allow/deny/ask typed result; hook can modify input but not fabricate approval |
+| `src/approval/modes.rs` | 200 · P0 | 5 modes × tool class decision table + transition rules (`plan`→`ask` on user confirm) | mode table unit-tested exhaustively; bypass mode banner + audit |
+| `src/approval/remember.rs` | 160 · P1 | session-scoped grants with exact pattern, expiry, scope display, revoke command | grant sirf exact command pattern pe; wildcard expansion user ko dikhe |
+| `src/retry.rs` | 220 · P0 | retry policy: classify transient/fatal, jittered backoff, provider hints (`retry-after`), attempt ledger | 3 attempts max default; retry storms impossible (token bucket) |
+| `src/error.rs` | 240 · P0 | `AgentError` taxonomy + `remediation()` strings + exit-code mapping | har user-visible error me next step; error codes stable for docs/support |
+| `src/config/mod.rs` | 260 · P0 | typed config facade: load, merge, get, watch; env override parsing | invalid config = startup fail with file:line; unknown key = error (typo safety) |
+| `src/config/layers.rs` | 220 · P0 | 6-layer precedence resolution + provenance tracking (`config explain <key>`) | kis file se value aayi wo dikhe; managed layer immutable |
+| `src/config/validate.rs` | 240 · P1 | JSON-schema + semantic validation; cross-field rules (sandbox off + bypass = reject) | har error actionable; warnings non-fatal but shown |
+| `src/config/managed.rs` | 200 · P2 | admin-locked layer: signature optional, merge with 'most restrictive wins' for security keys | developer override attempt = warning + audit; enterprise me hard fail |
+| `src/features.rs` | 120 · P2 | feature flag gates (compile-time cfg + runtime flags), staged rollout keys | flag default safe; every flag has owner + removal date |
+| `src/events.rs` | 220 · P0 | event bus: broadcast + persistence tap + telemetry tap + UI tap; lag detection | slow subscriber drop ho, producer block na ho; event order per thread guaranteed |
+| `src/tasks.rs` | 220 · P1 | plan/todo state machine: IDs, statuses, dependencies, progress events | model plans visible + editable; compaction ke baad plan survive kare |
+| `src/subagent/mod.rs` | 320 · P1 | single subagent spawn (legacy/simple path): isolated session, tool subset, budget, summary-only return | child context parent me leak na ho; child cancel parent ko na mare |
+| `src/subagent/types.rs` | 200 · P2 | built-in profiles: explore, plan, implement, test, review, security (prompt + tools + budget) | profile = data (no code fork); custom profiles markdown se load hon |
+| `src/verify.rs` | 240 · P2 | post-edit verification: detect build/test command, run it, parse verdict, attach evidence | test failure = model ko structured output; silent 'looks fine' kabhi nahi |
+| `src/util/mod.rs` | 60 · P0 | small pure helpers: `now()`, `rand_id()`, `clamp`, no I/O | zero deps on other crates; unit tested |
+| `src/util/paths.rs` | 220 · P0 | workspace root detection, canonicalization, **single** path-confinement function | path escape (`..`, symlink, absolute) ek hi jagah block ho; property tested |
+| `src/util/truncate.rs` | 140 · P0 | grapheme-safe head/tail/by-bytes truncation with markers | UTF-8 kabhi na toote; wide chars count correct |
+| `src/util/dedup.rs` | 160 · P1 | content hash based duplicate detection for reads/outputs | same file twice = 'unchanged since last read' marker |
+| `src/clock.rs` | 80 · P1 | `Clock` trait: real vs frozen (tests), monotonic + wall time | time-dependent tests deterministic; timeouts testable |
+
+### 9.5 `crates/policy` — 12 files · ~3,040 LOC
+_Control plane — rules, redaction, audit_ — The control plane: deny-first rules, risk classification, redaction, tamper-evident audit.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 100 · P0 | `Policy` facade: evaluate(call) -> Decision + explain(), reload(), snapshot() | evaluate < 2 ms; hot path me allocation minimal |
+| `src/rules.rs` | 340 · P0 | rule model + matchers: path globs, command prefixes/argv patterns, host, tool name, specifier | matcher precedence documented; `rm -rf *` pattern argv-aware (glob pe nahi) |
+| `src/engine.rs` | 320 · P0 | deny-first evaluation, specificity tie-break, `explain()` reason tree, decision cache | deny always wins; cache invalidation on grants; every decision reproducible |
+| `src/modes.rs` | 240 · P0 | mode semantics + legal transitions + per-mode default rules | bypass mode requires flag + non-prod detection; plan mode read-only enforce |
+| `src/classifier.rs` | 300 · P2 | heuristic risk scorer (argv verbs, path sensitivity, network) + optional model tie-breaker | heuristic recall > 95% on a 200-command corpus; model call only on ambiguous |
+| `src/redaction.rs` | 300 · P0 | secret/PII detection: regex + entropy + known formats; placeholder substitution; allowlist | pre-egress mandatory; false-positive reportable; reversible nahi (by design) |
+| `src/audit.rs` | 320 · P1 | hash-chained append-only log, entry schema, anchors every N, verify command | tamper detection 100% (bit flip test); write cost < 1 ms |
+| `src/audit_export.rs` | 240 · P2 | sinks: syslog RFC5424, OTLP logs, rotating JSONL; batching + backpressure | SIEM ko real-time; export fail = local retention + alert |
+| `src/managed.rs` | 260 · P2 | admin policy merge with most-restrictive-wins, signature verification, lock flags | developer cannot weaken managed deny (test); signature optional but audited |
+| `src/network.rs` | 220 · P2 | egress decision for tools + proxy config generation + blocklist/allowlist evaluation | wildcard `*` explicit; DNS rebinding guard |
+| `src/incident.rs` | 200 · P2 | kill switch: global stop, per-repo deny, session revoke, in-flight cancellation | 1 command me sab workers stop; audit entry with actor |
+| `src/attribution.rs` | 200 · P1 | binds action → identity, session, worker, repo, commit, worktree; propagates to audit | PR label/session id correlation; worker actions parent se traceable |
+
+### 9.6 `crates/context` — 22 files · ~5,450 LOC
+_Context economy — assembly, compaction, memory_ — The context economy: what the model sees, in which order, and what gets thrown away.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 70 · P0 | `ContextEngine` facade: assemble(), pressure(), compact(), restore() | loop sirf facade call kare; internals swappable |
+| `src/assembler.rs` | 360 · P0 | build final request: section order, cache boundaries, token budget enforcement | prefix stability test (same input → identical bytes) + snapshot |
+| `src/sections.rs` | 240 · P0 | `Section { kind, stability, content, tokens }` with ordering rules and cache flags | volatile section ko stable se pehle daalna = compile-time impossible (type-level order) |
+| `src/system_sections.rs` | 300 · P0 | ordered system fragments: identity, rules, tool policy, mode, env, repo summary | fragment toggling via feature/mode; total system < 6k tokens |
+| `src/memory/mod.rs` | 220 · P1 | memory loader/merger: precedence, dedupe, size caps, provenance | user vs project conflict deterministic; source path shown in debug overlay |
+| `src/memory/hierarchy.rs` | 280 · P0 | AGENTS.md upward discovery, nested lazy load on dir read, rules globs | lazy load ka token cost track ho; symlink loops handled |
+| `src/memory/auto.rs` | 240 · P2 | agent-written notes: candidate → review → persist; TTL + provenance | auto-memory bina user approval ke global na ho; poisoning resist |
+| `src/memory/conflicts.rs` | 200 · P2 | deterministic precedence resolver + conflict report in debug output | same key two files me = winner + loser logged, silent override nahi |
+| `src/attachments.rs` | 240 · P1 | explicit refs: `@file`, `@dir`, `@url`, images, pasted blobs with caps | bade attachments auto-truncate with hint; binary detect |
+| `src/imports.rs` | 180 · P2 | inline file imports in prompts with depth/size guards and cycle detection | recursive import loop = error, hang nahi |
+| `src/compaction/mod.rs` | 300 · P0 | compaction driver: thresholds, pre/post hooks, event emission, chain-of-compactions | compaction idempotent-ish; double compaction race blocked |
+| `src/compaction/ladder.rs` | 260 · P0 | escalating strategy chain: run cheapest, stop when budget met, record which stage freed what | each stage's token savings logged; data drives tuning |
+| `src/compaction/snip.rs` | 240 · P0 | clip oversized tool outputs (head+tail), drop old images, cap diffs | clip = lossy but marked; model ko pata ho ki content clipped hai |
+| `src/compaction/dedupe.rs` | 220 · P1 | remove duplicate reads/outputs, collapse repeated file views | dedupe marker me original line range ho |
+| `src/compaction/collapse.rs` | 300 · P2 | reversible folding of inactive segments (stub + pointer), full history retained | collapse ke baad reconstruct possible (JSONL se) |
+| `src/compaction/summarize.rs` | 400 · P0 | model-assisted summary with pinned facts (goal, decisions, files, tests, next steps) | summary quality eval (5 golden cases); hallucinated file list = test fail |
+| `src/compaction/restore.rs` | 240 · P1 | post-compaction re-injection: last edited files, active plan, failing test command | amnesia regression test: 30-turn task survives 2 compactions |
+| `src/compaction/prompt.rs` | 200 · P0 | summariser prompt + strict JSON output contract + retry on schema fail | schema-validated; summary length budget enforced |
+| `src/ledger.rs` | 280 · P0 | token ledger: per-section estimate, provider truth, drift, watermarks, projections | ledger vs actual < 8%; expose via `/context` command |
+| `src/pressure.rs` | 200 · P0 | pre-flight overflow prediction (input + expected output), soft/hard watermarks | overflow error kabhi na aaye; compaction pre-emptively |
+| `src/tool_budget.rs` | 260 · P2 | tool schema budget: eager set, deferred set, on-demand schema disclosure | 40 tools ho to bhi first turn tokens < 8k |
+| `src/scratchpad.rs` | 220 · P1 | agent-maintained scratch state (plan, hypotheses, open questions) that survives compaction | scratchpad update cost < 200 tokens; stale entries auto-expire |
+
+### 9.7 `crates/index` — 8 files · ~2,150 LOC
+_Code intelligence — repo map, search_ — Code understanding without shipping the whole repo: tree-sitter tags, graph ranking, search.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 70 · P1 | `Index` facade: build(), map_for(prompt, budget), invalidate(path) | index optional ho (disable flag); bina index ke bhi agent chale |
+| `src/repo_map/mod.rs` | 300 · P1 | repo map builder: file selection, budget split, render to markdown-ish tag tree | 1–4k token map; build < 3 s cold, < 40 ms incremental |
+| `src/repo_map/tags.rs` | 420 · P1 | tree-sitter queries per language: definitions, references, exports; tag struct | 10+ languages (rust, ts/js, py, go, java, c/cpp, ruby, php, c#, bash); query load fallback |
+| `src/repo_map/graph.rs` | 320 · P1 | file/symbol graph, edge weights (mentions ×10, open files ×50, sqrt(ref count)) | graph build memory < 100 MB for 200k files (streaming) |
+| `src/repo_map/pagerank.rs` | 260 · P1 | personalised PageRank with chat-seeded restart vector + budgeted selection | deterministic output (same input → same map); convergence < 30 iterations |
+| `src/repo_map/cache.rs` | 240 · P2 | SQLite tag cache keyed by (path, mtime, size, grammar version); GC | cache invalidation correct on rename; stale cache never silently used |
+| `src/search.rs` | 320 · P0 | grep integration (ripgrep binary if present, else in-process walker), ranking, filters | 50k files me < 300 ms; binary absence detected at startup |
+| `src/file_tree.rs` | 220 · P0 | gitignore-aware traversal, depth/size caps, symlink policy, binary skip | node_modules/.git skip by default; override config |
+
+### 9.8 `crates/tools` — 39 files · ~10,520 LOC
+_Capability surface — file/patch/shell/LSP/web_ — The capability surface exposed to the model: primitives first, adapters second, all policy-checked.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 120 · P0 | `Tool` trait re-exports, tool list assembly per mode, feature gates | tool set ek function se bane (mode+policy+config input) |
+| `src/tool.rs` | 300 · P0 | `trait Tool { name, schema, risk, validate, preview, execute, ui_hint }` + blanket impls | har tool ko risk class + preview mandatory; naya tool bina risk = compile error |
+| `src/schema.rs` | 240 · P0 | JSON-Schema builder helpers + per-schema token estimator | schema < 200 tokens target; description style guide enforced by test |
+| `src/registry.rs` | 280 · P0 | static + dynamic (MCP/plugin) tool pool, collision resolution, enable/disable, versioning | MCP tool name clash = prefix (`mcp__server__tool`); disabled tool schema na bheje |
+| `src/fs/read.rs` | 340 · P0 | paged read: offset/limit lines, byte cap, binary sniff, image passthrough, encoding detect | 4k-line file ka 200-line window; `showing 1–200 of 4312` hint |
+| `src/fs/write.rs` | 260 · P0 | atomic write (temp+rename), backup, encoding/EOL preserve, dir create | write ke baad fsync optional; partial file kabhi na likhe |
+| `src/fs/edit.rs` | 320 · P0 | exact string replace with occurrence count, uniqueness check, context anchors | ambiguous match = error with candidate contexts, blind replace nahi |
+| `src/fs/multi_edit.rs` | 240 · P1 | batch edits across files, all-or-nothing with journal | ek fail = poora batch rollback; partial state kabhi na |
+| `src/fs/glob.rs` | 200 · P0 | glob patterns, gitignore respect, sort by mtime/path, result cap | 100k files pe < 200 ms; hidden files policy config |
+| `src/fs/ls.rs` | 180 · P0 | directory listing with sizes, type markers, ignore rules, depth limit | large dir truncate with count; symlink marked |
+| `src/fs/move_copy.rs` | 200 · P2 | move/copy/delete with trash-by-default, cross-device fallback | delete = trash (recoverable) unless `--hard`; audit entry |
+| `src/fs/notebook.rs` | 260 · P3 | Jupyter `.ipynb` cell read/edit by index, output clear, kernel-agnostic | JSON structure preserved (no reformat of untouched cells) |
+| `src/patch/mod.rs` | 80 · P0 | patch facade: parse → validate → apply → journal; format auto-detect | teeno format (search/replace, unified, V4A) ek entry point se |
+| `src/patch/parser.rs` | 480 · P0 | robust parsers: fenced search/replace blocks, unified diff hunks, V4A; malformed recovery | fuzz-tested; partial/garbled model output se crash nahi |
+| `src/patch/apply.rs` | 420 · P0 | context-tolerant application: exact → whitespace-normalized → fuzzy anchor match | fuzzy match pe warning + confidence; 3 mismatches ke baad fail with diff |
+| `src/patch/validate.rs` | 300 · P0 | pre-flight validation against current bytes: anchors exist, counts match, no overlap | apply se pehle hi pata chale; model ko exact context wapas |
+| `src/patch/rollback.rs` | 260 · P1 | transaction journal: file snapshots, fsync, rollback on error, crash recovery | kill -9 ke baad bhi aadha patch nahi bacha (journal replay) |
+| `src/search/grep.rs` | 380 · P0 | regex search with context lines, file type filters, case modes, grouping, caps | 200 matches max with hint; binary files skipped |
+| `src/search/engine.rs` | 240 · P1 | engine selection: ripgrep subprocess vs in-process `ignore`+`regex` walker | subprocess fail = silent fallback (logged), user ko pata chale |
+| `src/shell/mod.rs` | 320 · P0 | shell tool: command spec build, risk scan, approval binding, execution, formatting | har command ka risk class; approval prompt me exact argv |
+| `src/shell/session.rs` | 380 · P1 | persistent shell: cwd/env/aliases survive across calls, prompt detection, marker protocol | `cd` ka effect next call pe; session restart pe state reset + notice |
+| `src/shell/background.rs` | 300 · P2 | background jobs: spawn, log capture, status, stop, orphan policy | dev server start karo aur chalta rahe; exit pe cleanup optional |
+| `src/shell/risk.rs` | 340 · P0 | command classification: read-only / mutating / destructive / network / privileged; arg-aware | `rm -rf /` = destructive; `git status` = read-only; table extensible via config |
+| `src/shell/format.rs` | 200 · P0 | output post-processing: ANSI strip, exit code, stderr merge policy, truncation | exit code hamesha included; ANSI escape model ko na jaye |
+| `src/net/fetch.rs` | 340 · P1 | HTTP GET with SSRF guard (private IP block), redirect policy, size cap, HTML→text | localhost/metadata IPs blocked; 5 MB cap with truncation |
+| `src/net/search.rs` | 280 · P2 | pluggable search backend (API key based), result ranking, citation formatting | no key = tool disabled (schema bhi nahi); citations me URL+date |
+| `src/lsp/client.rs` | 420 · P2 | LSP client: spawn server, initialize, document sync, request/response, shutdown | rust-analyzer/tsserver/gopls detect+spawn; server crash = degrade to grep |
+| `src/lsp/diagnostics.rs` | 300 · P2 | post-edit diagnostics collection with debounce, severity filter, grouping | edit ke 800 ms baad diagnostics; 50 max with severity sort |
+| `src/lsp/symbols.rs` | 260 · P3 | definition/references/hover queries for precise navigation | grep se better precision; latency budget 300 ms |
+| `src/git/status.rs` | 240 · P1 | status/diff/log summaries optimised for prompts (numstat, branch, ahead/behind) | 200-line diff cap with file summary; binary files marked |
+| `src/git/commit.rs` | 200 · P1 | commit creation with generated message, attribution trailer, signing passthrough | commit only after user approval; trailer me session id |
+| `src/git/worktree.rs` | 260 · P2 | ephemeral worktrees for parallel workers: create/remove/list, branch naming | worker crash pe worktree cleanup; disk usage capped |
+| `src/plan.rs` | 260 · P1 | plan/todo tool: create, update status, list, dependency edges; event emission | plan compaction survive kare; UI me live progress |
+| `src/ask_user.rs` | 220 · P1 | elicitation tool: structured questions (choice/multi/text), timeout, default | non-interactive mode me question skip + documented default |
+| `src/task.rs` | 300 · P1 | subagent tool (single + parallel): prompt, profile, budget, isolation level, report | parallel mode orchestrator ko delegate kare; depth limit 2 |
+| `src/memory_tool.rs` | 200 · P2 | explicit memory read/write with review gate and provenance | write = candidate first; user approve kare tab persist |
+| `src/render.rs` | 220 · P1 | per-tool UI render hints: kind (diff/terminal/table/image/json), collapse default, summary line | TUI ko tool semantics na pata ho; sirf hints |
+| `src/errors.rs` | 200 · P0 | tool error mapping to model-actionable messages + retryable flags | har error me next action; raw io error kabhi model ko na jaye |
+| `src/path_guard.rs` | 180 · P0 | the single choke-point for model-supplied paths: canonicalize, confine, symlink resolve | escape attempts 100% blocked; property test with adversarial paths |
+
+### 9.9 `crates/exec` — 10 files · ~2,420 LOC
+_Process execution — spawn, PTY, output_ — Process execution primitives: spawn, PTY, groups, env sanitising. No policy decisions here.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 100 · P0 | `Executor` facade + `ExecResult { status, stdout, stderr, duration, truncated }` | policy/sandbox decisions caller kare; exec sirf execute kare |
+| `src/spec.rs` | 220 · P0 | `CommandSpec { argv, cwd, env, stdin, timeout, shell_mode, pty }` + builder | shell vs argv mode explicit; quoting bugs impossible |
+| `src/spawn.rs` | 300 · P0 | tokio::process spawn, process group ownership, pre-exec hooks (sandbox), exit status map | child group kill on cancel; no zombie |
+| `src/pty.rs` | 340 · P1 | PTY allocation (portable-pty), raw mode, terminal size, resize | interactive tools (vim, ssh, psql) chale; no TTY = fallback pipe |
+| `src/pty_session.rs` | 360 · P2 | long-lived PTY session: write, read with idle timeout, expect-style wait for marker | shell session state persistent; output framing reliable |
+| `src/env.rs` | 220 · P0 | env scrubbing: strip secrets/agent vars, deterministic PATH, sandbox env injection | API keys child process ko na mile by default; opt-in passthrough |
+| `src/timeout.rs` | 180 · P0 | deadline enforcement, SIGTERM → grace → SIGKILL escalation, per-tool overrides | hung process ka wait kabhi infinite na ho |
+| `src/output.rs` | 260 · P0 | ring-buffer capture with byte caps, interleaved stdout/stderr policy, lossy markers | 1 GB output pe memory blow nahi; truncation visible |
+| `src/stream.rs` | 240 · P1 | live output streaming into `Event::ToolOutput` deltas with throttling | TUI smooth; 10k lines/s pe bhi UI freeze nahi |
+| `src/reaper.rs` | 200 · P1 | orphan/zombie cleanup: process group scan, kill-on-drop guard, startup sweep | agent crash ke baad bache child processes next start pe saaf |
+
+### 9.10 `crates/sandbox` — 12 files · ~3,420 LOC
+_OS isolation — bwrap/Landlock/Seatbelt/AppContainer_ — Defence in depth per OS. One policy type, four backends, one availability probe.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 200 · P0 | backend selection (probe result → backend), fail-closed policy, apply(child) | sandbox unavailable = refuse to run shell (unless explicit override) |
+| `src/policy.rs` | 260 · P0 | `SandboxPolicy`: read/write roots, network mode, spawn allowed, env allowlist, resource limits | policy serialisable + hashable (audit me store) |
+| `src/backend.rs` | 180 · P0 | `trait SandboxBackend { name, available, wrap_command, apply_to_child }` | naya OS backend = 1 file; core untouched |
+| `src/linux_bwrap.rs` | 340 · P1 | bubblewrap argv: ro-binds for system paths, rw-bind workspace, unshare net, tmpfs /tmp | escape test suite pass; missing bwrap = next backend |
+| `src/linux_landlock.rs` | 360 · P1 | Landlock ruleset built in single-threaded worker pre-exec, ABI detection | kernel < 5.13 = unavailable (probe); ruleset verified by self-test |
+| `src/linux_seccomp.rs` | 320 · P2 | seccomp-BPF allowlist filter: block mount/ptrace/raw sockets/kexec | filter load fail = warn + degrade (not silent); test with known-bad syscalls |
+| `src/macos_seatbelt.rs` | 380 · P1 | SBPL profile generation (deny default + explicit allows) + sandbox-exec invocation | profile syntax error = startup self-test fail; home read blocked by default |
+| `src/windows_appcontainer.rs` | 360 · P2 | AppContainer profile creation, capability SIDs, child launch into container | network capability optional; file access via granted paths only |
+| `src/windows_job.rs` | 240 · P2 | job object: memory/process/time limits, kill-on-close, UI restrictions | child processes sandbox se bahar na nikle |
+| `src/network.rs` | 320 · P2 | egress allowlist enforcement: loopback proxy config, DNS policy, host matching | allowlist ke bahar connect = blocked + audit; proxy env child ko set |
+| `src/probe.rs` | 220 · P0 | runtime detection per OS with cached result + human-readable capability report | `doctor` same probe use kare; result 60 s cached |
+| `src/diagnostics.rs` | 240 · P1 | explains WHY a sandboxed command failed: denied path, missing bind, net blocked | error me exact fix suggestion; support tickets 50% kam |
+
+### 9.11 `crates/state` — 17 files · ~3,520 LOC
+_Persistence — JSONL truth, SQLite index, snapshots_ — Durable truth: append-only rollouts for replay, SQLite for query, snapshots for undo.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 140 · P0 | `Store` facade + bootstrap (dirs, pragmas, migration run) + health check | read-only FS pe clear error; corrupt DB = quarantine + rebuild from JSONL |
+| `src/db.rs` | 220 · P0 | sqlx pool, WAL, busy_timeout, transaction helpers, test DB harness | concurrent readers + single writer; WAL checkpoint policy |
+| `src/migrations/0001_init.sql` | 180 · P0 | tables: threads, turns, messages, tool_calls, workers + indices | migration forward-only; and run on 100 MB fixture < 5 s |
+| `src/migrations/0002_usage.sql` | 120 · P1 | usage/cost tables per turn, model, worker; aggregation views | cost queries < 10 ms; retention-friendly |
+| `src/migrations/0003_rollout.sql` | 120 · P1 | rollout file index, compaction boundaries, message↔file offsets | JSONL me seek by offset (full replay ke bina) |
+| `src/migrations/0004_fts.sql` | 100 · P2 | FTS5 virtual table over message text + triggers | search < 50 ms on 100k messages; tokenizer config |
+| `src/migrations/0005_approvals.sql` | 120 · P2 | approval grants, policy snapshots, audit anchors, worker leases history | grant audit trail complete; snapshot versioned |
+| `src/models.rs` | 260 · P0 | row structs, lossless <-> protocol conversions, typed queries | no stringly-typed columns; migration change = compile error |
+| `src/threads_repo.rs` | 260 · P0 | thread CRUD, fork lineage, list with filters, archive/delete | fork 100 ms ke andar; lineage query O(1) depth |
+| `src/turns_repo.rs` | 240 · P0 | turn lifecycle persistence, crash reconciliation (incomplete → interrupted) | kill -9 ke baad state consistent; no duplicate turns |
+| `src/messages_repo.rs` | 240 · P0 | ordered append, pagination for resume, part-level storage | 1M messages me paging < 20 ms |
+| `src/rollout.rs` | 280 · P0 | JSONL append writer: event → line, fsync policy, rotation, checksum per line | crash-safe tail (partial line ignored); file < 100 MB rotate |
+| `src/replay.rs` | 260 · P2 | deterministic replay/export: JSONL → event stream → UI/assertions | replay produces identical UI state hash; export redaction pass |
+| `src/resume.rs` | 260 · P1 | resume semantics: rebuild session, verify cwd/git/model drift, warn, continue | drift warnings explicit; resumed turn kabhi corrupt na ho |
+| `src/snapshot.rs` | 300 · P1 | content-addressed blobs + per-turn manifest for undo; shadow-git checkpoint option | undo < 200 ms; disk cap with GC; binary files handled |
+| `src/history_search.rs` | 200 · P3 | FTS query builder, ranking, snippet extraction, filters (repo/model/date) | search results clickable in TUI; snippet highlight |
+| `src/gc.rs` | 220 · P2 | retention policy, size caps, vacuum, orphan blob/worktree cleanup | disk never unbounded; GC logged; dry-run mode |
+
+### 9.12 `crates/tui` — 36 files · ~10,100 LOC
+_Terminal UI — render, input, approval UX_ — Renderer + input. Immediate-mode draw, virtualised transcript, terminal capability probing.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 160 · P0 | `run_ui(ctx)`: terminal init, event loop, restore guard, panic hook, suspend/resume | panic/kill pe terminal saaf; 60 fps sustained |
+| `src/app.rs` | 520 · P0 | `AppState`: threads, transcript cache, overlays, focus, board, scroll anchors, input buffer | state immutable snapshots for tests; memory O(visible) |
+| `src/event.rs` | 240 · P0 | `UiEvent`: key/mouse/paste/resize/tick + `AgentEvent` wrapper + channel plumbing | crossterm thread kabhi block na ho; tick 16 ms |
+| `src/update.rs` | 420 · P0 | pure reducer `(AppState, UiEvent) -> (AppState, Vec<SideEffect>)` | 100% unit tested bina terminal; reducer me I/O zero |
+| `src/submit.rs` | 220 · P0 | prompt submit: validation, optimistic echo, op send, cancel handle, queueing while busy | double-submit safe; queued prompts visible |
+| `src/keymap/mod.rs` | 240 · P1 | layered keymap resolution (default < user < mode), chord support, conflict report | user override file reload live; unknown action = warning |
+| `src/keymap/default.rs` | 200 · P1 | default bindings: submit, newline, interrupt, cancel, history, palette, quit | har binding discoverable via `/help keys`; no terminal-specific hacks |
+| `src/keymap/vim.rs` | 460 · P3 | modal editing: normal/insert/visual, motions, operators, registers, undo | vim users ko muscle memory mile; off by default |
+| `src/input/editor.rs` | 480 · P0 | multi-line editor: grapheme cursor, selection, undo/redo, soft wrap, kill-ring | emoji/CJK me cursor drift zero; 10k-line paste me freeze nahi |
+| `src/input/history.rs` | 220 · P1 | prompt history: persistent, dedupe, prefix search, per-repo scoping | Ctrl-R search; history file 0600 |
+| `src/input/completion.rs` | 320 · P1 | `@file` fuzzy completion, `/command` completion, arg hints, ranking | 10k files me < 30 ms; ignored dirs excluded |
+| `src/input/paste.rs` | 220 · P1 | bracketed paste handling, large paste → file ref, image drag/paste path | 100 KB paste se context blow na ho |
+| `src/input/mouse.rs` | 180 · P3 | mouse tracking: scroll, click to focus regions, selection copy, disable in alt-screen off | mouse optional; keyboard-only path complete |
+| `src/render/mod.rs` | 240 · P0 | draw orchestration: layout → widgets → terminal diff flush, frame timing guard | frame budget 16 ms p95; slow frame warning in debug |
+| `src/render/layout.rs` | 260 · P0 | responsive layout: header, transcript, composer, status, overlay, board panel | < 60 cols pe degrade; resize ke baad anchor stable |
+| `src/render/transcript.rs` | 420 · P0 | virtualised message list: wrap cache, height cache, anchor preservation, sticky turn header | 10k messages scroll 60 fps; memory O(visible) |
+| `src/render/markdown.rs` | 460 · P0 | incremental markdown → styled lines: code blocks, lists, tables, links, streaming-safe | **trust boundary**: sab escape sequences strip; partial block render |
+| `src/render/syntax.rs` | 320 · P1 | tree-sitter highlighting with bounded LRU cache and language detect | 10k-line block pe < 50 ms; cache miss pe fallback plain |
+| `src/render/diff.rs` | 380 · P1 | unified + side-by-side diff, word-level emphasis, hunk navigation, accept/reject hooks | 500-line diff readable; wide terminal auto side-by-side |
+| `src/render/approval.rs` | 320 · P0 | permission prompt: exact command, cwd, risk badge, scope preview, keyboard-first choices | fixed chrome (stream se draw nahi); default = deny, Enter pe confirm |
+| `src/render/tool_card.rs` | 300 · P0 | collapsible tool cards with per-kind rendering + status + duration + cost | collapsed default for noisy tools; expand on demand |
+| `src/render/table.rs` | 200 · P2 | markdown table rendering with width-aware truncation and alignment | narrow terminal me horizontal scroll ya stacked |
+| `src/render/status.rs` | 220 · P1 | status bar: model, mode, tokens/window, cost, branch, sandbox, workers, latency | always visible; warning states coloured + text |
+| `src/render/spinner.rs` | 160 · P0 | activity phases (thinking/tool/waiting), elapsed, interrupt hint, no-flicker animation | reduced-motion + a11y mode me static |
+| `src/render/overlay.rs` | 320 · P1 | modals: help, model picker, session list, permission editor, diff review, board detail | Esc always closes; modal input isolation tested |
+| `src/render/toast.rs` | 160 · P2 | transient notices + error banner with remediation + dismiss | errors actionable; no modal for non-blocking info |
+| `src/render/theme.rs` | 240 · P0 | semantic colour tokens (accent/danger/muted), 16/256/truecolor mapping, user themes | contrast ratio >= 4.5; NO_COLOR respected |
+| `src/render/image.rs` | 240 · P3 | optional kitty/sixel image render with capability gate + fallback placeholder | unsupported terminal pe crash nahi; image cap 2 MB |
+| `src/term/caps.rs` | 300 · P1 | capability probe: DA1/DA2, COLORTERM, kitty keyboard, sync output, hyperlinks; cached | probe < 80 ms first run, cached after; wrong guess se degrade safe |
+| `src/term/raw.rs` | 220 · P0 | raw mode, alternate screen, cursor hide, panic-safe RAII guard, SIGTSTP suspend | any exit path restores terminal (tested with forced panic) |
+| `src/term/clipboard.rs` | 140 · P2 | OSC 52 copy + native fallback (pbcopy/clip/wl-copy), size limits | tmux/screen me working; fallback detect |
+| `src/render/board.rs` | 320 · P2 | live multi-agent board: worker cards, DAG edges, progress, tokens, cost, merge queue | 9 workers tak readable; 10 fps update se CPU spike nahi |
+| `src/slash/mod.rs` | 200 · P1 | slash command registry, parsing, arg schema, autocomplete metadata | custom commands markdown se load; unknown command hint |
+| `src/slash/builtin.rs` | 380 · P1 | `/help /model /mode /compact /context /cost /permissions /undo /resume /board /workers` | har command ka help text + example; state-changing commands confirm |
+| `src/a11y.rs` | 200 · P2 | screen-reader mode: linear output, no animation, verbatim text, focus narration | NVDA/VoiceOver usable; toggle persisted |
+| `src/debug_overlay.rs` | 220 · P2 | Ctrl-D overlay: last request sections, token ledger, timings, cache hit, policy decisions | support me self-serve debugging; secrets redacted |
+
+### 9.13 `crates/cli` — 14 files · ~2,230 LOC
+_Entrypoints — subcommands, headless, doctor, update_ — Binary entrypoints, clap subcommands, headless mode, auth/doctor/update. Zero business logic.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/main.rs` | 70 · P0 | `fn main()`: panic hook install, `TerminalGuard` fallback restore, tokio multi-thread runtime, argv[0] dispatch, map `ExitCode` | `agent`, `agent-tui`, `agent-exec` ek hi binary se; panic pe terminal kabhi corrupt nahi; `--version` < 60 ms |
+| `src/lib.rs` | 60 · P0 | `run(args) -> Result<ExitCode>`; re-export command modules for integration tests; no globals | binary logic testable bina process spawn ke; har subcommand ek `fn run(ctx)` |
+| `src/cli.rs` | 260 · P0 | clap `derive` tree: global flags (`--model/--mode/--config/--cwd/--json/--no-sandbox/--verbose`), env var bindings, `ArgGroup` conflicts | `--help` me har flag ka example; unknown flag = exit 2; shell-agnostic quoting docs |
+| `src/commands/mod.rs` | 80 · P0 | `CommandCtx { config, cwd, out: OutputSink, cancel }` + registry of subcommands | output sink injectable (pretty/plain/json), isliye tests deterministic |
+| `src/commands/interactive.rs` | 150 · P0 | TTY detect → `tui::run_ui(ctx)`; non-TTY → line REPL; `--resume <id>` boot path | pipe me chalao to crash nahi; `Ctrl-C` twice = clean exit; resume warns on cwd/git drift |
+| `src/commands/exec.rs` | 220 · P1 | headless runner: prompt from arg/stdin/`-f`, `--output-format text\|json\|jsonl`, exit codes (0 ok, 1 error, 42 input, 53 turn-limit) | CI me stable contract; `jq` se stream parse ho; stdout pe sirf result, logs stderr pe |
+| `src/commands/review.rs` | 180 · P2 | diff-scoped review: `--base main`, hunks collect, reviewer prompt, structured findings, exit code on severity | PR gate me use ho; `--fail-on high`; findings JSON me file:line ke saath |
+| `src/commands/mcp_serve.rs` | 160 · P2 | agent ko MCP server banao (`rmcp` server, `run_task`/`review` tools) stdio pe | doosre agents ise tool ki tarah call kar sakein; recursion guard (depth header) |
+| `src/commands/auth.rs` | 200 · P1 | `login [--device\|--api-key]`, `logout`, `status`; auth crate ko delegate; token kabhi stdout pe nahi | SSH pe device flow; CI me `AGENT_API_KEY` env; status me expiry + scope dikhe |
+| `src/commands/doctor.rs` | 240 · P1 | probe matrix: terminal caps, sandbox backends, keyring, proxy, disk, sqlite, provider reachability, config validation | har fail line ke saath fix hint; `--json` me machine-readable; < 2 s |
+| `src/commands/config_cmd.rs` | 190 · P1 | `get/set/unset/list/edit/paths`; layered resolution dikhao (kaunsi file se value aayi) | galat key pe suggestion; managed key pe edit = error with reason |
+| `src/commands/update.rs` | 200 · P2 | signed manifest fetch, version compare, download+verify (minisign/cosign), atomic swap, rollback slot | offline pe silent skip; signature fail = abort + audit; `--check` dry run |
+| `src/commands/completions.rs` | 90 · P3 | `clap_complete` for bash/zsh/fish/pwsh + `man` page generation | generated files release me ship hon; CI me drift check |
+| `src/signals.rs` | 130 · P0 | SIGINT/SIGTERM/SIGHUP/SIGWINCH handlers → `CancellationToken` + resize events; second SIGINT = force exit | kill -TERM pe child processes cleanup; suspend/resume (SIGTSTP) me screen restore |
+
+### 9.14 `crates/server` — 14 files · ~3,400 LOC
+_Headless surfaces — JSON-RPC app-server + ACP_ — Headless surfaces: JSON-RPC app-server (IDE/SDK) and ACP (editors) over the same core.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 120 · P1 | server bootstrap: router, capability advertisement, shutdown coordination | stdio/ws dono same handler set use karein |
+| `src/jsonrpc.rs` | 300 · P1 | JSON-RPC 2.0: framing, request/response correlation, notification routing, error codes | malformed frame = protocol error, connection survives |
+| `src/app_server.rs` | 340 · P1 | client session registry, subscription to thread events, backpressure, client caps | ek client slow ho to doosra affected na ho; max clients cap |
+| `src/methods/session.rs` | 260 · P1 | `session/new\|fork\|resume\|list\|close` handlers with validation | session list me cost/turns; close = graceful cancel |
+| `src/methods/turn.rs` | 320 · P1 | `turn/submit\|interrupt\|approve` + streaming notifications (`turn/delta`, `tool/call`) | IDE ko real-time streaming; cancel ack with final state |
+| `src/methods/tools.rs` | 220 · P2 | `tools/list\|call` for host-side execution (editor provides FS/buffer tools) | host tools registry + capability negotiation |
+| `src/methods/config.rs` | 200 · P2 | `config/read\|write\|schema` with validation and managed-key protection | invalid write = structured error; managed key write = denied |
+| `src/auth.rs` | 180 · P2 | local trust model: stdio = trusted, WS = token from file/env, origin check | no open TCP port by default; token 0600 |
+| `src/transport_stdio.rs` | 160 · P1 | newline-delimited JSON over stdin/stdout, log redirection to stderr | stdout sirf protocol; logs kabhi mix na ho |
+| `src/transport_ws.rs` | 240 · P2 | WebSocket transport with ping/pong, max frame, backpressure | desktop/IDE clients; reconnect with resume token |
+| `src/acp/mod.rs` | 340 · P2 | ACP agent endpoint: initialize, session/new, prompt turn, session/update stream | ACP v1 conformant; Zed/JetBrains/Neovim me chal jaye |
+| `src/acp/session_map.rs` | 220 · P2 | ACP session ↔ core thread mapping, cancellation, permission request bridging | editor cancel = core cancel; no orphan sessions |
+| `src/acp/permissions.rs` | 240 · P2 | maps ACP permission options to policy engine decisions + remember grants | editor UI me same risk info; grants ACP scope me persist na ho |
+| `src/sdk_schema.rs` | 260 · P3 | emit JSON schema + TS/Python stubs; versioned artifacts in `sdk/` | SDK drift CI check; breaking change = major bump |
+
+### 9.15 `crates/orchestrator` — 9 files · ~2,490 LOC
+_Parallel subagents — DAG, leases, merge gates_ — Advanced parallel subagents: DAG planning, file leases, deterministic scheduler, merge + verify gates.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 90 · P2 | `Orchestrator::run(Plan, ctx)` facade: config (max workers, budgets), cancel tree, event sink | ek call me poora parallel job; parent turn isse await kare |
+| `src/dag.rs` | 280 · P1 | task graph: node kinds (explore/implement/test/review/doc), edges, topo sort, cycle detection, ready-set, critical path | invalid plan (cycle/self-dep) = error with node ids; ready-set O(1) update |
+| `src/scheduler.rs` | 420 · P2 | deterministic ready-queue: concurrency cap, priority (verify > review > implement > explore), fairness, AIMD on 429, token budget pool | same plan → same schedule (seeded); 429 pe concurrency auto-half; starvation zero |
+| `src/leases.rs` | 220 · P2 | write-set leases per worker: acquire/queue/expire, deadlock-free ordering, steal on stall, conflict → requeue | do workers same file ek saath edit na karein; lease expiry 5 min + heartbeat |
+| `src/worker.rs` | 380 · P2 | worker lifecycle: worktree create, child session, narrowed policy + tool subset, prompt contract, budget, cancel, artifact collect | worker crash parent ko na mare; per-worker cost cap enforced |
+| `src/report.rs` | 240 · P1 | structured `WorkerReport { summary, files, patch_ref, tests, confidence, blockers, evidence }` + schema validation | parent ko sirf 300–600 token summary; raw transcript sidecar me |
+| `src/merge.rs` | 360 · P3 | sequential merge queue: rebase onto tip, 3-way merge, conflict policy (retry worker / escalate), revert | merge order deterministic; conflict rate measured |
+| `src/verify_gate.rs` | 280 · P3 | per-merge gate: build/test/lint evidence capture, quarantine on fail, retry budget | broken code mainline me na jaye; failure evidence worker ko wapas |
+| `src/board_model.rs` | 220 · P2 | board state: worker states, progress %, tokens, cost, DAG status, merge queue snapshot | TUI/server dono isi model se render karein; 10 fps updates |
+
+### 9.16 `crates/ext` — 10 files · ~2,300 LOC
+_Extensibility — skills, hooks, plugins, commands_ — Everything a customer can add without forking: skills, hooks, plugins, custom commands.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 100 · P1 | extension host: discovery, enable/disable resolution, load order, conflict policy | project > user > plugin precedence; disabled extension ka code load na ho |
+| `src/skills/mod.rs` | 220 · P2 | skill model: name, description (trigger), allowed tools, budget, inline vs fork mode | metadata-only listing (cheap); body lazy load |
+| `src/skills/loader.rs` | 280 · P2 | `SKILL.md` discovery + frontmatter parse + validation + injection | invalid skill = warning not crash; body cap 8k tokens |
+| `src/hooks/mod.rs` | 240 · P1 | hook event catalogue, matcher syntax (`tool == shell && cmd =~ ...`), ordering | hooks deterministic order; JSON payload schema documented |
+| `src/hooks/exec.rs` | 320 · P1 | hook execution: shell/webhook/verifier kinds, timeout, exit-code semantics (2 = block) | hook fail open vs closed configurable; 10 s default timeout |
+| `src/plugins/manifest.rs` | 260 · P3 | plugin manifest: name/version/components/constraints; component registry | 10 component types; version constraint mismatch = clear error |
+| `src/plugins/verify.rs` | 240 · P3 | signature + provenance verification (cosign/sigstore), checksum, trust store | unsigned plugin = blocked by default; enterprise trust policy |
+| `src/commands/custom.rs` | 220 · P2 | markdown-defined slash commands with arg schema + template rendering | team workflows shareable; `${args}` injection escaped |
+| `src/agents_md.rs` | 200 · P2 | subagent/worker profile files (markdown frontmatter): tools, model, budget, prompt | custom worker profiles without code; validation errors actionable |
+| `src/watcher.rs` | 220 · P3 | file watching with debounce for config/skills/hooks/AGENTS.md hot reload | reload safe (no mid-turn corruption); debounce 300 ms |
+
+### 9.17 `crates/auth` — 6 files · ~1,310 LOC
+_Credentials — keyring, OAuth, CI identity_ — Credentials without leaking them: OS keyring, OAuth PKCE, short-lived tokens.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 90 · P1 | credential facade: provider → credential strategy, caching, refresh hooks | callers ko token kabhi string me na mile (opaque handle) |
+| `src/keyring.rs` | 220 · P1 | OS keychain (Keychain/CredMgr/Secret Service) with encrypted-file fallback (0600) | headless server pe fallback warn kare; file key user-scope |
+| `src/oauth_pkce.rs` | 300 · P1 | PKCE flow: localhost loopback callback, state/nonce validation, token exchange | browser open fail = URL print; callback 60 s timeout |
+| `src/device_code.rs` | 240 · P2 | device-code flow for SSH/headless with polling and expiry | SSH me login possible; expiry par clean error |
+| `src/token_store.rs` | 260 · P1 | token cache with expiry, refresh scheduling, revocation, per-provider scoping | refresh single-flight (no thundering herd); revoked token detected |
+| `src/service_account.rs` | 200 · P2 | CI mode: env/Workload Identity/OIDC federation credentials; no interactive prompt | CI me kabhi hang na ho; missing creds = exit 42 with hint |
+
+### 9.18 `crates/git` — 6 files · ~1,400 LOC
+_Repository awareness — status, diff, worktrees, checkpoints_ — Repository awareness: branch, dirty state, checkpointing, isolated worktrees.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 100 · P1 | repo discovery (walk up), worktree detection, facade over gix + git CLI fallback | bare repo / submodule / worktree edge cases handled |
+| `src/repo.rs` | 280 · P1 | open repo, branch/HEAD/status summary, ahead-behind, dirty file list for prompt | summary < 50 ms; huge repo me limited scope |
+| `src/diff.rs` | 260 · P1 | working tree/staged/commit-range diff extraction, numstat, per-file hunks | binary detect; 5 MB diff cap with file-level summary |
+| `src/commit.rs` | 220 · P1 | commit creation: staged path selection, message, trailer, signing passthrough | never commits unrequested files; trailer me session id |
+| `src/worktree.rs` | 240 · P2 | create/remove ephemeral worktrees, branch naming, lockfile, cleanup on crash | 10 workers = 10 worktrees; disk cap + GC |
+| `src/checkpoint.rs` | 300 · P2 | shadow-git checkpoint per turn: tree hash, restore, list, prune | undo one turn < 300 ms; restore conflict-free (isolated refs) |
+
+### 9.19 `crates/telemetry` — 6 files · ~1,320 LOC
+_Observability — tracing, OTLP, support bundle_ — Observability that is opt-in, scrubbed, and useful for support without leaking code.
+
+| File | LOC · Phase | Code (kya likhna hai) | Features / acceptance |
+|---|---|---|---|
+| `src/lib.rs` | 120 · P1 | init/guard: subscriber install, flush on exit, panic capture hook | crash pe last 200 log lines preserved |
+| `src/tracing_setup.rs` | 220 · P1 | layered tracing: rolling file (JSONL), stderr (TTY-aware), env filters, sampling | log volume cap; secrets never logged (redaction layer) |
+| `src/otel.rs` | 260 · P2 | OTLP spans: turn → model call → tool → worker; attributes schema; batched export | export failure = non-blocking; cardinality controlled |
+| `src/metrics.rs` | 240 · P2 | counters/histograms: latency, tokens, tool success, cache hit, worker parallelism | metric names stable/documented; local aggregation for `/cost` |
+| `src/privacy.rs` | 260 · P1 | scrubber: paths, prompts, hostnames, emails; opt-in surface; preview command | default off; `telemetry preview` me exact payload dikhe |
+| `src/support_bundle.rs` | 220 · P2 | one-command bundle: logs, config (redacted), doctor output, last session metadata | user ko preview; size < 5 MB; no code content |
+
+**Total: 308 files · ~76,560 LOC.** Test files (§11) isme count nahi hain — unka estimate 0.6 × per source file hai.
+
+---
+
+### 9.20 Agar team chhoti hai — slicing guide
+
+| Team size | Kya banao | Files | LOC | Timeline |
+|---|---|---:|---:|---|
+| 1–2 devs | **Tier B**: P0 only + `read/write/edit/grep/shell` + 1 provider + basic TUI | 129 | 33k | 6–9 mahine |
+| 3–4 devs | P0 + high-value P1 (`compaction`, `mcp`, `state/resume`, `policy/audit`, `orchestrator/dag`) | ~190 | ~49k | 12–15 mahine |
+| 5–8 devs | Full P0–P2 | 294 | 73k | 12–14 mahine |
+| 8+ devs | P0–P3 + multi-surface | 308 | 76.5k | 13–15 mahine |
+
+Rule of thumb: **P0 se zyada mat kaato.** P0 me hi ~43% code hai kyunki wahi "walking skeleton" hai — bina uske baaki sab hypothetical hai.
+
+**File-level ordering:** `research/file-manifest.csv` ko phase se filter karo; P0 = 129 rows. Har row ka detailed spec Part VII me hai.
+
+---
+
+# PART VIII — Contracts, quality, enterprise, execution
+
+## 10. Cross-cutting contracts (jo sab crates share karte hain)
+
+Ye section "single source of truth" hai. Yahan jo shape decide hoga, wo 308 files me repeat hoga — isliye ise week 1 me freeze karna zaroori hai.
+
+### 10.1 Op catalogue (client → agent)
+
+| Op | Payload | Ack | Notes |
+|---|---|---|---|
+| `Submit` | `{ prompt, attachments[], mode?, model? }` | `TurnId` | idempotent by `op_id` |
+| `Steer` | `{ turn_id, text }` | — | next tool boundary pe inject |
+| `Interrupt` | `{ turn_id }` | `TurnId` | cancel tree, children kill |
+| `Approve` | `{ request_id, decision, remember? }` | — | request_id single-use |
+| `Compact` | `{ turn_id?, focus? }` | — | manual compaction |
+| `SetMode` | `{ mode }` | — | audited |
+| `SpawnWorkers` | `{ plan }` | `RunId` | parallel mode (§7) |
+| `CancelWorkers` | `{ run_id, worker_id? }` | — | kill switch path |
+| `Shutdown` | `{}` | — | graceful, flush state |
+
+### 10.2 Event catalogue (agent → client) — 30 events, 6 families
+
+| Family | Events |
+|---|---|
+| **Turn** | `TurnStarted`, `TurnCompleted`, `TurnFailed`, `TurnCancelled`, `StateChanged` |
+| **Content** | `TextDelta`, `ThinkingDelta`, `TextCompleted`, `ContentReplaced` (compaction) |
+| **Tools** | `ToolRequested`, `ToolApprovalNeeded`, `ToolApprovalDecided`, `ToolStarted`, `ToolOutputDelta`, `ToolCompleted`, `ToolFailed`, `ToolDenied` |
+| **Context** | `ContextAssembled` (sizes only), `CompactStarted`, `CompactStage`, `CompactCompleted`, `MemoryLoaded` |
+| **Workers** | `WorkerSpawned`, `WorkerProgress`, `WorkerReported`, `WorkerCancelled`, `MergeQueued`, `MergeCompleted`, `VerifyResult` |
+| **System** | `UsageUpdated`, `CostUpdated`, `Warning`, `Error`, `ConfigChanged`, `SessionResumed` |
+
+Rules: every event has `{ id, thread_id, turn_id?, ts, schema_version }`; events are **additive-only**; UI must ignore unknown variants (forward compat).
+
+### 10.3 Tool catalogue (v1)
+
+| Tool | Args (summary) | Risk | Approval in `ask` | Result shape |
+|---|---|---|---|---|
+| `read_file` | path, offset, limit | read | no | numbered lines + truncation hint |
+| `write_file` | path, content | mutate | yes | bytes written, backup ref |
+| `edit_file` | path, old, new, occurrence? | mutate | yes | diff + match count |
+| `apply_patch` | patch (3 formats), dry_run? | mutate | yes | per-file hunks applied/failed |
+| `glob` | pattern, sort?, limit? | read | no | paths + count |
+| `grep` | pattern, glob?, context?, max? | read | no | grouped matches |
+| `list_dir` | path, depth? | read | no | tree + sizes |
+| `shell` | command, cwd?, timeout?, session? | **exec** | yes (mode-dependent*) | exit code, stdout/stderr (capped) |
+| `plan` | items[], update? | state | no | plan ids + status |
+| `task` | goal, profile, parallel? | spawn | yes (first time) | WorkerReport summary |
+| `web_fetch` | url, max_bytes? | net | yes | text + title + bytes |
+| `ask_user` | question, options[] | meta | n/a | chosen option |
+| `git_status` | — | read | no | branch, dirty files |
+| `git_diff` | scope, path? | read | no | unified diff (capped) |
+| `diagnostics` | path? | read | no | LSP diagnostics |
+| `mcp__*` | server-defined | server-declared | per policy | server-defined |
+
+\* `shell` read-only commands (allowlisted) auto-approve in `ask`; mutating/destructive prompt.
+
+### 10.4 Policy pattern grammar
+
+```
+pattern   := tool "(" selector ")"
+tool      := "shell" | "read" | "write" | "net" | "mcp" | "*"
+selector  := path-glob | argv-pattern | host | tool-name
+argv-pattern := token (" " token)*           # token "=" literal, "*" = any single, "**" = rest
+examples
+  shell(git status)            # exact argv match
+  shell(cargo test * )         # fixed prefix + one arg
+  shell(rm -rf **)             # destructive prefix (deny)
+  read(src/**)                 # path glob within workspace
+  net(api.anthropic.com)       # host
+  mcp(github.*)                # MCP server tool
+```
+
+Evaluation order: **deny → ask → allow** (deny-first). Specificity tie-break: longer literal prefix wins. Every decision returns `explain()` string: `denied by rule #3 shell(rm -rf **) at .agent/config.toml:12`.
+
+### 10.5 Persistence schema (SQLite, 5 migrations)
+
+| Table | Key columns | Purpose |
+|---|---|---|
+| `threads` | id, parent_id, cwd, model, created, archived | session tree |
+| `turns` | id, thread_id, status, started, ended, cost_micros | turn ledger |
+| `messages` | id, turn_id, role, parts_json, tokens | ordered history |
+| `tool_calls` | id, turn_id, name, args_hash, decision, exit, duration_ms | audit-able actions |
+| `workers` | id, run_id, node_id, state, worktree, tokens, cost | parallel runs |
+| `leases` | run_id, worker_id, paths_hash, acquired, expires | conflict record |
+| `usage` | turn_id, model, in/out/cache/reasoning | cost attribution |
+| `approvals` | id, pattern, scope, expires | session grants |
+| `audit_anchors` | seq, hash, ts | tamper evidence |
+| `messages_fts` | rowid, text | search |
+
+JSONL rollout line (append-only truth):
+
+```json
+{"v":1,"ts":"2026-10-30T09:12:44.118Z","thread":"01JB...","turn":"01JB...","type":"ToolCompleted","data":{...},"checksum":"blake3:..."}
+```
+
+### 10.6 Error taxonomy (user-visible codes)
+
+| Code | Class | Example | Recovery |
+|---|---|---|---|
+| `E1xxx` | config | unknown key, invalid mode | `agent config explain`, doctor |
+| `E2xxx` | provider | 429, auth, model not found | retry hint, `auth login` |
+| `E3xxx` | tool | path denied, patch mismatch, timeout | model-facing hint |
+| `E4xxx` | sandbox | unavailable, denied path, net blocked | `--no-sandbox`, doctor |
+| `E5xxx` | state | disk full, db locked, corrupt rollout | resume, prune |
+| `E6xxx` | protocol | version mismatch, bad frame | upgrade hint |
+| `E7xxx` | orchestration | cycle, budget exhausted, conflict | re-plan, reduce nodes |
+
+Har error me: code, one-line message, **next action**, aur `--verbose` me detail. Support ko code se search karna aasan.
+
+### 10.7 Metric names (stable, documented)
+
+`turn_duration_ms`, `ttft_ms`, `tokens_in/out/cache_read`, `tool_calls_total{tool,status}`, `tool_duration_ms`, `compact_stage_tokens_saved{stage}`, `context_tokens{section}`, `cache_hit_ratio`, `sandbox_denials_total`, `approval_latency_ms`, `worker_active`, `merge_conflicts_total`, `verify_failures_total`, `crash_total`.
+
+Cardinality rule: labels sirf bounded sets (tool name, status, stage). Paths/prompts **kabhi** label me nahi.
+
+---
+
+## 11. Quality bar — tests, evals, budgets, CI
+
+### 11.1 Test matrix (kaunsi crate ka kaunsa test mandatory)
+
+| Crate | Unit | Snapshot (`insta`) | Property (`proptest`) | Fuzz | Integration | Cross-platform |
+|---|---|---|---|---|---|---|
+| `protocol` | schema round-trip | ✅ event JSON | ✅ serde round-trip | — | — | — |
+| `core` | state machine, budgets, approval table | ✅ prompt assembly | ✅ budget invariants | — | ✅ full turn (mock) | — |
+| `model` | converters, token math | ✅ request payloads | ✅ IR↔provider round-trip | ✅ SSE parser | ✅ 4 provider contract tests | — |
+| `context` | ledger, ladder selection | ✅ assembled prefix | ✅ token monotonicity | — | ✅ 30-turn survival | — |
+| `index` | ranking, tags | ✅ repo map | — | ✅ tree-sitter query parser | ✅ 500k LOC fixture | — |
+| `tools` | per-tool contract | ✅ tool output shape | ✅ **patch apply∘reverse = identity** | ✅ **patch parser** | ✅ temp repo | ✅ path semantics |
+| `exec` | spec, timeout | — | — | — | ✅ PTY session | ✅ **ConPTY**, signals |
+| `sandbox` | policy mapping | — | — | — | ✅ **escape suite** | ✅ 3 OS |
+| `policy` | deny-first order, matcher | ✅ decision tables | ✅ monotonicity (more deny = never more allow) | ✅ pattern parser | ✅ audit chain | — |
+| `state` | repos, migrations | — | ✅ crash consistency (kill -9 loop) | — | ✅ 100 MB DB | — |
+| `tui` | reducer (pure) | ✅ **frames** per terminal tier | — | ✅ markdown/ANSI parser | — | ✅ 3 terminal profiles |
+| `server` | jsonrpc framing | ✅ payloads | — | ✅ frame parser | ✅ ACP conformance | — |
+| `orchestrator` | dag, scheduler, leases | ✅ board states | ✅ **no-clobber invariant** | — | ✅ 5-task run | — |
+| `ext` | frontmatter, hook matcher | ✅ payloads | — | — | ✅ plugin verify | — |
+| `auth` | token logic | — | — | — | ✅ mock IdP | — |
+| `git` | diff, worktree | — | — | — | ✅ real repos | ✅ worktree paths |
+| `telemetry` | scrubber | ✅ redaction cases | — | — | — | — |
+
+**Counts (estimates):** ~179 test/snapshot files, ~600 unit tests, ~250 snapshots, 8 fuzz targets, 40 eval tasks.
+
+### 11.2 Fuzz targets (nightly, 30 min each)
+
+1. `patch/parser` — garbled model output (highest risk).
+2. `tui/render/markdown` + ANSI stripper — **escape injection**.
+3. `model/stream` SSE decoder — malformed framing.
+4. `config` TOML + schema — unknown keys, huge files.
+5. `index/tags` tree-sitter queries — malformed source.
+6. `policy/rules` pattern parser — pathological globs.
+7. `server/jsonrpc` framing — truncated frames.
+8. `state/rollout` JSONL reader — corrupt lines.
+
+Rule: har fuzz crash = regression test (fix ke saath commit).
+
+### 11.3 Eval suite (product quality, not just correctness)
+
+| Tier | Tasks | Cadence | Cost cap | Purpose |
+|---|---|---:|---:|---|
+| Smoke | 5 | every PR (mock) | $0 | plumbing |
+| Internal | 40 | nightly | ~$8 | real fixes: bug, feature, refactor, docs, test-gen |
+| External | Terminal-Bench 2.0 subset (20) | weekly | ~$25 | shell competence |
+| External | SWE-bench Verified subset (20) | weekly | ~$30 | patch quality |
+| Parallel | 5-task DAG corpus | weekly | ~$12 | §7.15 metrics |
+
+Report card per run: `pass@1`, **tokens/solved task**, turns, tool calls, wall time, cost, failure-mode histogram. **Gate:** tokens/solved-task 10% se zyada na badhe, warna PR block (harness regression).
+
+### 11.4 Performance budgets (CI-enforced, fail = red)
+
+| Metric | Budget | Job |
+|---|---:|---|
+| Cold start (`--version`) | < 60 ms | hyperfine |
+| Startup → first TUI frame | < 120 ms | instrumented |
+| Idle RSS (empty session) | < 120 MB | cgroup measure |
+| Transcript scroll frame (10k msgs) | p95 < 16 ms | bench |
+| SSE event → UI update | < 2 ms | bench |
+| Prompt assembly | < 5 ms | bench |
+| SQLite write (turn end) | < 8 ms | bench |
+| Binary size (release, stripped) | < 38 MB | size check |
+| Incremental build (1 crate) | < 25 s | CI timing |
+| Parallel run overhead (vs serial) | < 2.2× tokens | eval |
+
+### 11.5 CI pipeline (stages + budgets)
+
+| Stage | Command | Timeout | Blocks merge? |
+|---|---|---|---|
+| fmt | `cargo fmt --check` | 1 min | ✅ |
+| clippy | `cargo clippy --all-targets -- -D warnings` | 8 min | ✅ |
+| test (unit+snapshot) | `cargo nextest run --profile ci` | 10 min | ✅ |
+| doc | `cargo doc --no-deps` (warnings = error) | 5 min | ✅ |
+| deny/audit | `cargo deny check` + `cargo audit` | 3 min | ✅ |
+| typos + markdown lint | `typos`, `markdownlint` | 1 min | ✅ |
+| platform matrix | linux x64/arm64, macos arm64, **windows x64** | 20 min | ✅ |
+| perf budgets | bench job on main only | 15 min | ✅ (main) |
+| fuzz smoke | 2 min per target | 16 min | nightly |
+| eval smoke | 5 tasks, mock | 5 min | nightly |
+| mutation (security crates) | `cargo-mutants` on `policy`, `sandbox`, `patch` | weekly | advisory → then blocking |
+| cross-platform PTY | Windows VM + 3 terminal emulators | 10 min | ✅ |
+
+### 11.6 Release gates (har release)
+
+1. All CI green on tag commit; reproducible build hash match.
+2. SBOM attached (`cargo-cyclonedx`), signatures (cosign) + notarization.
+3. Changelog with **breaking-change** section (config/CLI/protocol).
+4. Upgrade + downgrade test: previous version ke session resumption.
+5. Smoke install on 3 OS, `agent doctor` clean.
+6. Eval delta vs last release documented (pass rate + tokens).
+7. Security: no new `unsafe`, `cargo-deny` clean, advisory triage done.
+8. Rollback plan tested (update slot revert).
+
+### 11.7 Snapshot policy (kyunki 250 snapshots maintain karni hain)
+
+- Snapshots **intent** document karte hain, implementation nahi — ek snapshot fail ho to pehle poochho "behaviour badla ya formatting?"
+- `.snap` me sirf rendered output; metadata minimal (diff noise kam).
+- Har snapshot ka ek owner crate (CODEOWNERS) — random updates banned.
+- `INSTA_FORCE_UPDATE` PR me justify karna hoga (reviewer checklist).
+- Flaky snapshots (timing, IDs) allowed nahi — injectable clock/IDs use karo.
+
+### 11.8 Distribution & release engineering
+
+| Channel | Mechanism | Notes |
+|---|---|---|
+| Direct download | `cargo-dist` artifacts (linux x86_64/aarch64 musl, macOS universal, Windows x64/arm64) | static musl for Linux |
+| npm | thin JS shim + postinstall binary fetch | Codex pattern; JS me business logic zero |
+| Homebrew | tap with formula + bottle | macOS/Linux |
+| Windows | Scoop manifest + winget | ARM64 support |
+| Containers | `FROM scratch`-ish image, non-root, no shell | CI/agent-in-container |
+| Self-update | signed manifest, staged rollout, **rollback slot** | `cli/commands/update.rs` |
+
+Security gates in CI:
+1. `cargo-deny` (licenses, advisories, bans, sources) — allowlist: MIT, Apache-2.0, BSD-3, ISC, Unicode-3.0. `ring`/`aws-lc` jaise licenses case-by-case.
+2. `cargo-audit` + `osv-scanner` daily.
+3. `cargo-cyclonedx` SBOM per release; Sigstore/cosign signature; SLSA provenance (optional but sales-friendly).
+4. macOS notarization + hardened runtime; Windows Authenticode.
+5. Reproducible build check (`SOURCE_DATE_EPOCH`, `--remap-path-prefix`).
+6. `cargo-mutants` weekly on `policy`, `sandbox`, `patch` (mutation score > 80% for security crates).
+
+### 11.9 Cross-platform reality
+
+| Area | Risk | Mitigation |
+|---|---|---|
+| Windows ConPTY | PTY behavior differs; Ctrl+C semantics | `portable-pty` + real Windows CI VM tests |
+| Windows paths | `\\?\` prefixes, case-insensitivity, MAX_PATH | path normalisation in `core/util/paths.rs`, tests |
+| macOS Seatbelt | deprecated `sandbox-exec`, SIP interactions | probe + profile test at startup; fallback ask-mode + warn |
+| Linux userns | some distros disable unprivileged userns | bwrap probe → Landlock fallback → fail-closed |
+| Terminals | 30+ emulators, wildly different caps | capability probe + 5 profile tiers, snapshot tests per tier |
+| Locales/encoding | non-UTF8 files, CRLF, BOM | encoding detection (`encoding_rs`), preserve on write |
+| Signals | SIGWINCH/SIGTSTP/SIGCONT handling | `signal-hook`, suspend/resume tests |
+
+### 11.10 Documentation & developer experience (yes, ye bhi files hain)
+
+Code ke alawa ~60–90 non-code files chahiye (manifest me count nahi kiye):
+
+- `docs/` — quickstart, config reference (generated from schema), sandbox matrix, MCP guide, ACP guide, hooks reference, security model, threat model, troubleshooting.
+- `docs/adr/` — 15 ADRs (section 6.5).
+- `.github/workflows/` — 8–12 workflows (ci, release, nightly eval, fuzz, audit, docs).
+- `prompts/` — 10–15 embedded prompt fragments (system, compact, summarizer, plan, review, classifier).
+- `examples/` — 3 sample plugins, 5 hooks, 2 MCP configs.
+
+**Prompt files ko code treat karo:** versioned, snapshot-tested, aur eval se gated. Prompt change = behavior change = regression risk.
+
+### 11.11 Observability (support ke bina enterprise nahi)
+
+| Signal | Where | Retention |
+|---|---|---|
+| Structured logs | `~/.agent/logs/*.jsonl` ring buffer | 7 din / 50 MB |
+| Turn traces (spans: turn → model call → tool) | local, OTLP optional | 24 h |
+| Latency/token/tool-failure metrics | in-memory + periodic summary | session |
+| `agent doctor` | env + sandbox + provider + config validation | on demand |
+| `agent support-bundle` | redacted tar.gz with preview | on demand |
+
+Rule: **code/prompt content kabhi default telemetry me nahi.** Metadata (counts, timings, error codes) allowed; content opt-in only.
+
+---
+
+## 12. Enterprise readiness — 12 pillars ka file-level mapping
+
+Enterprise sale model quality se nahi, **controls** se hoti hai. Har pillar ka ek owner crate hai, aur ek evidence jo auditor ko dikha sakte ho.
+
+| # | Pillar | Implementing files | Evidence auditor ko |
+|---|---|---|---|
+| 1 | **Identity** (OIDC/SAML device flow, CI service accounts) | `auth/{lib,oauth_pkce,device_code,token_store,service_account}.rs`, `cli/commands/auth.rs` | `agent auth status` output, token scope, expiry |
+| 2 | **Policy-as-code** (admin-locked) | `core/config/managed.rs`, `policy/managed.rs`, `policy/rules.rs` | signed managed policy file + `config explain` showing managed source |
+| 3 | **Permission plane** (deny-first, 5 modes) | `policy/{engine,modes,classifier}.rs`, `core/approval/*` | decision log with rule id + `explain()` string |
+| 4 | **OS sandbox** (3 OS) | `sandbox/*` (12 files) | `agent doctor` sandbox matrix + escape test results |
+| 5 | **Egress control** | `sandbox/network.rs`, `policy/network.rs`, `tools/net/fetch.rs` | blocked-host audit entries, allowlist diff |
+| 6 | **Audit trail** (hash-chained) | `policy/{audit,audit_export}.rs`, `core/events.rs`, `state/rollout.rs` | `agent audit verify` + SIEM screenshot |
+| 7 | **Data governance** (local-first, redaction, retention) | `policy/redaction.rs`, `telemetry/privacy.rs`, `state/gc.rs` | redaction test corpus, retention config, `telemetry preview` |
+| 8 | **Air-gap / BYO model** | `model/providers/{bedrock,vertex,ollama,custom}.rs`, `cli/commands/doctor.rs` | offline demo, no phone-home (network trace) |
+| 9 | **Supply chain** | CI (`cargo-deny`, SBOM, cosign), `cli/commands/update.rs`, `ext/plugins/verify.rs` | signed binary + SBOM + provenance attestation |
+| 10 | **Observability** | `telemetry/*`, `cli/commands/doctor.rs` | OTLP trace screenshot, support bundle (redacted) |
+| 11 | **Extensibility without forking** | `ext/*`, `mcp/*`, `server/acp/*` | custom skill + hook + MCP server demo |
+| 12 | **Operability** (CI mode, exit codes, replay) | `cli/commands/exec.rs`, `state/replay.rs`, `protocol/*` | CI pipeline YAML + JSONL replay of a real incident |
+
+### 12.1 Deployment modes
+
+| Mode | Model endpoint | Telemetry | Update | Kiske liye |
+|---|---|---|---|---|
+| **Local dev** (default) | vendor API | off | auto (signed) | individuals |
+| **Managed corporate** | vendor via proxy | OTLP to SIEM (opt-in) | pinned/off | enterprises |
+| **VPC / self-hosted gateway** | internal proxy (`providers/custom.rs`) | SIEM | manual | regulated |
+| **Air-gapped** | local vLLM/Ollama | none (local logs only) | offline bundle | defense/health |
+
+Air-gap requirements (testable): no DNS on start, no update check, offline license file, no crash reporter, `--no-network` flag that **hard-fails** any outbound attempt (audited).
+
+### 12.2 Threat model summary (detailed table: §6.7.4)
+
+| # | Threat | Primary defence | File |
+|---|---|---|---|
+| T1 | Prompt injection via repo content | untrusted-content tagging, tool allowlist per turn | `context/sections.rs` |
+| T2 | Malicious MCP server / tool description | first-run approval, description sanitisation, pinned versions | `mcp/*`, `policy/managed.rs` |
+| T3 | **Terminal escape injection** (OSC 52 clipboard, fake approval UI) | single trusted render layer, whitelist CSI/OSC, fixed approval chrome | `tui/render/markdown.rs`, `term/caps.rs` |
+| T4 | Approval fatigue → blind `y` | risk classes, default deny focus, scope preview, batch summaries | `approval/*`, `tui/render/approval.rs` |
+| T5 | Sandbox escape | fail-closed probe, escape suite, managed `--no-sandbox` ban | `sandbox/probe.rs` |
+| T6 | Credential exfiltration | redaction pre-egress, secret-path deny list, keyring only | `policy/redaction.rs`, `auth/keyring.rs` |
+| T7 | Supply chain (crate/plugin/update) | `cargo-deny`, lockfile, SBOM, signing, rollback slot | CI, `ext/plugins/verify.rs` |
+| T8 | Audit tampering | hash chain + anchors, separate from rollout | `policy/audit.rs` |
+| T9 | Data exfil via tools/MCP | egress allowlist at sandbox + tool host allowlist | `policy/network.rs` |
+| T10 | Provider-side retention | zero-retention mode, BYO endpoint, per-repo policy | `model/providers/*` |
+
+### 12.3 Compliance evidence kit (SOC 2-ready)
+
+Ye cheezein **product ke andar** honi chahiye, docs me nahi:
+
+1. **Change evidence** — signed releases, SBOM, reproducible hash, changelog with security section.
+2. **Access evidence** — `auth status` per session, SSO group mapping, service-account inventory.
+3. **Action evidence** — `audit verify` + exported JSONL per repo/date range.
+4. **Control evidence** — managed policy file + `config explain` showing locked values, `doctor --json`.
+5. **Incident evidence** — kill switch audit entry, session revoke log, support bundle (redacted).
+
+### 12.4 Security review demo script (15 minutes, jo buyer ko chahiye)
+
+1. `agent doctor --json` → sandbox backends, caps, config provenance.
+2. Repo me prompt-injection attempt → agent **refuses** (T1) aur rule id dikhata hai.
+3. `rm -rf` request → policy deny, exit 3, audit entry with rule + actor.
+4. Sandboxed command → `bwrap` proof (`/proc/self/status` output, no net).
+5. `agent audit verify` → chain valid; ek byte mutate → verify fail (tamper demo).
+6. `telemetry preview` → exactly kya bhejta (none by default).
+7. Parallel run on 5 tasks → board, leases (no clobber), merge gate, consolidated diff.
+8. Air-gap mode: `--no-network` + local model → task completes, network attempts logged as denied.
+
+**Rule:** agar ye 8 steps demo nahi ho sakte, product "enterprise-ready" nahi hai — chahe features kitne bhi hon.
+
+---
+
+## 13. Execution discipline — DoD, risks, backlog, traceability
+
+### 13.1 Definition of Done — per file
+
+Ek file "done" hai jab:
+
+1. Public items documented; crate me `#![warn(missing_docs)]`.
+2. Kam se kam ek test (pure logic ho to property test, UI ho to snapshot).
+3. Panic-free: `#![deny(clippy::unwrap_used, clippy::expect_used)]` (tests me allowed).
+4. `unsafe` nahi (except `sandbox`/`exec` with documented invariant + test).
+5. Async context me blocking I/O nahi.
+6. Tracing spans emit karta hai (`turn`, `tool`, `model`, `worker` correlate kar sakein).
+7. Errors typed (`thiserror`) + user-facing remediation string.
+8. Hot path ho to perf budget comment + bench.
+9. Role ek line me explain ho jaye (warna split).
+10. `clippy -- -D warnings` + `fmt` clean.
+
+### 13.2 PR checklist (template me hi daal do)
+
+```
+[ ] Scope: ek crate, ek concern (crates: protocol/core/tools/...)
+[ ] Tests: unit/snapshot added; golden transcript updated if prompt/tool changed
+[ ] Budgets: startup/RSS/frame impact measured (bench link)
+[ ] Security: no new path join outside path_guard; no raw output to terminal
+[ ] Contracts: protocol/event changes are additive + schema_version bumped
+[ ] Prompts: snapshot diff reviewed; eval smoke run
+[ ] Docs: config key → docs table; CLI flag → --help + docs
+[ ] Changelog entry (breaking? migration?)
+[ ] ADR added if architectural decision taken
+```
+
+### 13.3 Review rules
+
+- **Ek crate ka ek owner** approve karta hai; `protocol`, `policy`, `sandbox` ke liye **do** approvals (tech lead + security).
+- 400 LOC se bada diff = split (except generated/snapshot).
+- Prompt changes alag PR me (behavior vs code separate) — warna regression blame mushkil.
+- Snapshot updates alag commit me reason ke saath.
+
+### 13.4 Risk register (12 risks, owners ke saath)
+
+| # | Risk | P | Impact | Mitigation | Early signal | Owner |
+|---|---|---|---|---|---|---|
+| 1 | Scope creep (Devin-jaisa) | H | Fatal | Scope freeze §2.4; P3 backlog me | phase slip > 2 weeks | Tech lead |
+| 2 | TUI schedule eat kare | H | High | Fake events se P0 build; polish P1 | frame budget red | TUI eng |
+| 3 | Sandbox escape/bypass | M | Fatal (trust) | fail-closed, escape suite, external audit | `--no-sandbox` usage in telemetry | Security eng |
+| 4 | Provider API churn | H | Med | IR + adapters + contract tests | adapter LOC growth | Agent eng |
+| 5 | Context cost blowup | H | High | ledger + budgets + cache tests | tokens/solved-task up 10% | Agent eng |
+| 6 | Prompt injection (repo/MCP) | H | High | untrusted tagging, tool allowlist, hooks | unrequested net calls | Security eng |
+| 7 | Parallel mode merges break mainline | M | High | leases + verify gates + default off | conflict rate > 10% | Agent eng |
+| 8 | Windows parity slips | M | Med | Windows CI week 1, probe in P0 | no Windows CI = guaranteed slip | Infra |
+| 9 | Compile times kill velocity | M | Med | 19 crates, sccache, mold | incr build > 25 s | Infra |
+| 10 | Audit/policy retrofit | M | High | policy crate P0, audit P1 | "add logging later" talk | Security eng |
+| 11 | Team Rust ramp-up | M | Med | pair on hard crates, ADRs, lint gates | review latency up | Tech lead |
+| 12 | Parallel token cost shock users | M | Med | cost report + warning at < 1.3× speedup | support tickets | Agent eng |
+
+### 13.5 Backlog (v1 ke baad, priority order)
+
+1. **PR automation** — branch push, PR create, review comment loop (policy-gated, P3).
+2. **Browser tool** — Playwright-class capability behind sandbox + allowlist.
+3. **Remote/cloud sessions** — same core, app-server over TLS; team-shared sessions.
+4. **Embeddings index** — only if repo-map + grep recall < 80% on evals (measured, not assumed).
+5. **ACP v2** + editor registry listing.
+6. **Cost optimizer** — auto model tiering per turn, cache-aware batching.
+7. **Team policy server** — central managed policy distribution + telemetry aggregation.
+8. **Voice/dictation input**, **image-to-code**, **diagram render** in TUI.
+9. **Multi-repo / monorepo scale mode** — partial index, per-package context.
+10. **Fine-tuned routing classifier** — replace heuristics for approvals (only after data).
+
+### 13.6 Traceability matrix (requirement → crate → files → test)
+
+| Requirement | Crates | Key files | Test |
+|---|---|---|---|
+| R1 One prompt end-to-end | `core` | `agent/loop.rs`, `agent/state.rs` | golden transcripts |
+| R2 Safe multi-file editing | `tools` | `patch/*`, `fs/edit.rs` | fuzz + property (apply∘reverse) |
+| R3 Sandboxed execution | `exec`, `sandbox` | `sandbox/*`, `exec/spawn.rs` | escape suite (3 OS) |
+| R4 Context never overflows | `context` | `compaction/*`, `ledger.rs` | 30-turn survival test |
+| R5 Great terminal UX | `tui` | `render/*`, `input/*` | frame snapshots + perf |
+| R6 Integrations via MCP | `mcp`, `core` | `mcp/*`, `tools/mod.rs` | 3 servers + schema budget |
+| R7 Editor integration | `server` | `acp/*` | ACP conformance |
+| R8 Tamper-evident audit | `policy` | `audit.rs`, `audit_export.rs` | bit-flip verify test |
+| R9 Parallel subagents | `orchestrator` | `dag/scheduler/leases/merge` | 5-task corpus + no-clobber |
+| R10 CI/headless | `cli` | `commands/exec.rs` | exit-code contract test |
+| R11 Resume / undo | `state` | `resume.rs`, `snapshot.rs` | kill -9 + undo tests |
+| R12 Model freedom | `model` | `providers/*` | 4 provider contract tests |
+
+### 13.7 Decisions jo aap se chahiye (kickoff se pehle)
+
+1. **Primary OS priority?** Default: macOS + Linux first, Windows parity P2 (lekin CI week 1).
+2. **Default provider/model?** Config-driven; recommendation: Anthropic (cache + tools maturity) + OpenAI fallback.
+3. **License?** Apache-2.0 (enterprise-friendly, patent grant) — recommend.
+4. **Team reality?** 6 engineers ka plan hai; agar 3 hain to §9.20 ka slicing guide lo (129 files) aur P1 12 mahine me.
+5. **Monetization?** OSS core + paid enterprise (SSO/audit/policy server) ya pure OSS? Iska asar `ext/plugins` + `server` scope pe padta hai.
+6. **ZED Go codebase ka future?** Recommend: feature freeze + protocol parity oracle (§8.12), phir archive.
+7. **Telemetry vendor?** Default: none (local only). Enterprise: OTLP to customer's collector.
+8. **Parallel mode default?** Recommend `off` until §7.15 metrics pass.
+
+### 13.8 Glossary
+
+| Term | Meaning |
+|---|---|
+| **Op / Event** | Client→agent commands / agent→client facts |
+| **Thread / Turn** | Conversation stream / one user prompt's execution |
+| **Worker** | Isolated subagent with own worktree + budget |
+| **Lease** | Exclusive write permission on a path set |
+| **Repo map** | Token-budgeted tree-sitter + PageRank summary of the codebase |
+| **Compaction ladder** | 5-stage context reduction (snip → dedupe → collapse → summarise → isolate) |
+| **Cache boundary** | Point after which prompt bytes may change without invalidating cache |
+| **Verify gate** | Build/test/lint gate before a worker's change is merged |
+| **Escape suite** | Tests that attempt to break out of the sandbox |
+| **Bundle** | Redacted diagnostic archive for support |
+
+---
+
+### Final word
+
+Ye plan ka pura point ek hi hai: **agent ka dimaag model hai, product uska harness hai.** 308 files me se ~300 files harness ki hain — aur wahi 300 files decide karti hain ki aapka agent reliable lagega ya jua. Agar aap P0 (129 files / 33k LOC) 15 hafte me ship kar dete ho, to aapke paas ek asli agent hoga; baaki sab uske upar additive hai.
+
+---
+
+# PART IX — Appendix
+
+## 14. Sources
+
+1. OpenAI Codex architecture teardown — `codex.danielvaughan.com/2026/03/28/codex-rs-rust-rewrite-architecture/`
+2. Codex deepwiki (crate org, ThreadManager/Session/ContextManager) — `deepwiki.com/openai/codex`
+3. Codex internals: queue-pair protocol, guardian, 3-OS sandbox — `codex.danielvaughan.com/2026/04/10/codex-cli-internals-queue-pair-guardian-sandbox/`
+4. Codex sandbox analysis (Seatbelt / bwrap+Landlock+seccomp / restricted token) — `agent-safehouse.dev/docs/agent-investigations/codex`
+5. "Dive into Claude Code: The Design Space…" (arXiv 2604.14228) — permission modes, 5-layer compaction, 4 extensibility mechanisms
+6. Claude Code architecture deep dive (gist, source analysis) — 27 hook events, 7 permission layers, sidechain transcripts
+7. Reverse-engineering Claude Code — `sathwick.xyz/blog/claude-code` (renderer, query loop, tool pool)
+8. Ratatui / terminal capability matrix — `terminfo.dev/framework/ratatui`
+9. MCP specification 2026-07-28 (stateless core) + changelog — `modelcontextprotocol.io/specification/2026-07-28`
+10. Official Rust MCP SDK (`rmcp`) — `github.com/modelcontextprotocol/rust-sdk`
+11. Agent Client Protocol (Zed) — `morphllm.com/agent-client-protocol`, `rywalker.com/research/zed-agent-client-protocol`
+12. "The Scaffold Effect in Coding Agents" (KDD 2026 eval workshop) — 40× tokens/solved-task across harnesses
+13. Terminal-Bench 2.0 / SWE-bench Pro reporting — `openhands.dev/blog/ai-coding-benchmarks-explained`, `codersera.com` roundup
+14. Cross-platform sandbox crates & primitives — `docs.rs/skarn-sandbox`, `docs.rs/proc-sandbox`, ai-sandbox
+15. Enterprise AI coding agent deployment (7 mandatory controls) — `northflank.com/blog/enterprise-ai-coding-agent-deployment`, `digitalapplied.com/.../enterprise-coding-agent-deployment-playbook-2026`
+16. "Enterprise AI Agents: Everyone Passes the Checklist" — `heym.run/blog/enterprise-ai-agents`
+17. Aider repo map internals (tree-sitter + personalised PageRank) — `anishgandhi.com/aider-pagerank-codebase-ranking/`, `ggprompts.com/architecture/aider/`
+18. Goose architecture (crate layout, extension-first MCP) — `deepwiki.com/aaif-goose/goose`, `pyshine.com/goose/`
+19. Gemini CLI package structure & context engineering — `deepwiki.com/google-gemini/gemini-cli/1.2-package-structure`
+20. Direct measurements via GitHub API (30 Oct 2026): file counts for `openai/codex` (5,706 `.rs` / 9,791 total), `aaif-goose/goose` (598 `.rs`), `charmbracelet/crush` (844 `.go`), `sst/opencode` (4,787 `.ts`).
+
+> **Note on source reliability:** items 1–4, 6–7, 12–17 are third-party analyses of closed or fast-moving codebases; numbers may drift. Structural conclusions (crate split, compaction ladders, sandbox matrix) are corroborated across multiple independent sources. File counts in item 20 are first-party measurements of public repos on the stated date.
