@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/protocol",
+    "crates/policy",
+    "crates/exec",
+    "crates/sandbox",
+    "crates/context",
+    "crates/model",
+    "crates/tools",
+    "crates/state",
+    "crates/core",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/cmyolo441-coder/rust1"
+
+[workspace.dependencies]
+protocol = { path = "crates/protocol" }
+policy = { path = "crates/policy" }
+exec = { path = "crates/exec" }
+sandbox = { path = "crates/sandbox" }
+context = { path = "crates/context" }
+model = { path = "crates/model" }
+tools = { path = "crates/tools" }
+state = { path = "crates/state" }
+core = { path = "crates/core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+regex = "1"
+globset = "0.4"
+ignore = "0.4"
+toml = "0.8"
+sha2 = "0.10"
+libc = "0.2"
+similar = "2"
+unicode-width = "0.2"
+tempfile = "3"
+
+[profile.dev]
+opt-level = 1
+debug = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

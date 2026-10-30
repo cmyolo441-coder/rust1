@@ -1,0 +1,11 @@
+[package]
+name = "protocol"
+description = "Wire contracts: ops, events, IR messages, tool/permission/usage types. Types only, zero logic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
